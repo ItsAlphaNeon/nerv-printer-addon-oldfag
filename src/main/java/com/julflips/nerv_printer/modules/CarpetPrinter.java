@@ -1335,7 +1335,9 @@ public class CarpetPrinter extends Module implements MapPrinter {
         boolean northToSouth = true;
         boolean hasFoundAir = false;
         for (int x = workingInterval.getLeft(); x <= workingInterval.getRight(); x += linesPerRun.get()) {
-            for (int z = 0; z < 128; z++) {
+            int z = 0;
+            while (z < 128) {
+                boolean restartZLoop = false;
                 for (int lineBonus = 0; lineBonus < linesPerRun.get(); lineBonus++) {
                     int adjustedX = x + lineBonus;
                     if (adjustedX > workingInterval.getRight()) break;
@@ -1350,7 +1352,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
                             // We reverse the search too
                             if (!oppositeBlockState.isAir() && z < 64) {
                                 northToSouth = !northToSouth;
-                                adjustedZ = 127 - z;
+                                restartZLoop = true;
+                                break;
                             }
                         }
                         //ChatUtils.info("Add material for: " + mapCorner.add(x + lineBonus, 0, adjustedZ).toShortString());
@@ -1364,6 +1367,11 @@ public class CarpetPrinter extends Module implements MapPrinter {
                         }
                     }
                 }
+                if (restartZLoop) {
+                    z = 0;
+                    continue;
+                }
+                z++;
             }
             northToSouth = !northToSouth;
         }
