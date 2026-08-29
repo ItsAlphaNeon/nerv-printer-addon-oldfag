@@ -57,7 +57,23 @@ public final class ConfigSerializer {
         HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict
     ) throws IOException {
         writeToJson(file, type, reset, cartographyTable, finishedMapChest, null, null,
-            mapMaterialChests, dumpStation, mapCorner, materialDict, null);
+            mapMaterialChests, dumpStation, mapCorner, materialDict, null, null);
+    }
+
+    public static void writeToJson(
+        Path file,
+        String type,
+        Pair<BlockPos, Vec3d> reset,
+        Pair<BlockPos, Vec3d> cartographyTable,
+        Pair<BlockPos, Vec3d> finishedMapChest,
+        ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests,
+        Pair<Vec3d, Pair<Float, Float>> dumpStation,
+        BlockPos mapCorner,
+        HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
+        ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners
+    ) throws IOException {
+        writeToJson(file, type, reset, cartographyTable, finishedMapChest, null, null,
+            mapMaterialChests, dumpStation, mapCorner, materialDict, null, perimeterCorners);
     }
 
     public static void writeToJson(
@@ -74,7 +90,7 @@ public final class ConfigSerializer {
         Set<ItemStack> toolSet
     ) throws IOException {
         writeToJson(file, type, null, cartographyTable, finishedMapChest, usedToolChest, bed,
-            mapMaterialChests, dumpStation, mapCorner, materialDict, toolSet);
+            mapMaterialChests, dumpStation, mapCorner, materialDict, toolSet, null);
     }
 
     public static void writeToJson(
@@ -89,12 +105,13 @@ public final class ConfigSerializer {
         Pair<Vec3d, Pair<Float, Float>> dumpStation,
         BlockPos mapCorner,
         HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
-        Set<ItemStack> toolSet
+        Set<ItemStack> toolSet,
+        ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners
     ) throws IOException {
         JsonObject root = new JsonObject();
 
         root.addProperty("type", type);
-        if (reset != null) root.add("reset", blockPosVecPairToJson(reset));
+        if (reset != null) root.add("resetButton", blockPosVecPairToJson(reset));
         if (cartographyTable != null) root.add("cartographyTable", blockPosVecPairToJson(cartographyTable));
         if (finishedMapChest != null) root.add("finishedMapChest", blockPosVecPairToJson(finishedMapChest));
         if (usedToolChest != null) root.add("usedToolChest", blockPosVecPairToJson(usedToolChest));
@@ -141,6 +158,14 @@ public final class ConfigSerializer {
                 toolSetArray.add(stackObj);
             }
             root.add("toolSet", toolSetArray);
+        }
+
+        if (perimeterCorners != null) {
+            JsonArray cornersArray = new JsonArray();
+            for (Pair<BlockPos, Vec3d> corner : perimeterCorners) {
+                cornersArray.add(blockPosVecPairToJson(corner));
+            }
+            root.add("perimeterCorners", cornersArray);
         }
 
         Gson gson = new GsonBuilder().setPrettyPrinting().create();

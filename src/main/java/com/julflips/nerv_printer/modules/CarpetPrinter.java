@@ -104,14 +104,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         .build()
     );
 
-    private final Setting<List<Block>> startBlocks = sgGeneral.add(new BlockListSetting.Builder()
-        .name("start-blocks")
-        .description("Which block to interact with to start the printing process.")
-        .defaultValue(Blocks.STONE_BUTTON, Blocks.ACACIA_BUTTON, Blocks.BAMBOO_BUTTON, Blocks.BIRCH_BUTTON,
-            Blocks.CRIMSON_BUTTON, Blocks.DARK_OAK_BUTTON, Blocks.JUNGLE_BUTTON, Blocks.OAK_BUTTON,
-            Blocks.POLISHED_BLACKSTONE_BUTTON, Blocks.SPRUCE_BUTTON, Blocks.WARPED_BUTTON)
-        .build()
-    );
+    
 
     private final Setting<Integer> mapFillSquareSize = sgGeneral.add(new IntSetting.Builder()
         .name("map-fill-square-size")
@@ -233,9 +226,9 @@ public class CarpetPrinter extends Module implements MapPrinter {
         .build()
     );
 
-    private final Setting<Integer> resetChestCloseDelay = sgAdvanced.add(new IntSetting.Builder()
-        .name("reset-chest-close-delay")
-        .description("How many ticks to wait before closing the reset trap chest again.")
+    private final Setting<Integer> buttonPressDelay = sgAdvanced.add(new IntSetting.Builder()
+        .name("button-press-delay")
+        .description("How many ticks to wait after pressing the reset button before walking to the next checkpoint.")
         .defaultValue(10)
         .min(1)
         .sliderRange(1, 40)
@@ -271,7 +264,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
     private final Setting<Boolean> breakCarpetAboveReset = sgAdvanced.add(new BoolSetting.Builder()
         .name("break-carpet-above-reset")
-        .description("Break the carpet above the reset chest before activating. Useful when interactions trough blocks are not allowed.")
+        .description("Break the carpet above the reset button before activating. Useful when interactions trough blocks are not allowed.")
         .defaultValue(true)
         .build()
     );
@@ -420,16 +413,18 @@ public class CarpetPrinter extends Module implements MapPrinter {
     );
 
     int timeoutTicks;
-    int closeResetChestTicks;
+    int buttonPressTicks;
+    int cornerSelectCooldown;
     int interactTimeout;
     int toBeSwappedSlot;
+    boolean debugWipeOnly;
     long lastTickTime;
     boolean closeNextInvPacket;
     State state;
     State oldState;
     State debugPreviousState;
     Pair<Integer, Integer> workingInterval;     //Interval the bot should work in 0-127
-    Pair<BlockPos, Vec3d> reset;
+    Pair<BlockPos, Vec3d> resetButton;
     Pair<BlockPos, Vec3d> cartographyTable;
     Pair<BlockPos, Vec3d> finishedMapChest;
     ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests;
@@ -450,6 +445,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
     ArrayList<File> startedFiles;
     ArrayList<Integer> restockBacklogSlots;
     ArrayList<BlockPos> knownErrors;
+    ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners;
     Block[][] map;
     File mapFolder;
     File mapFile;
@@ -473,7 +469,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
         startedFiles = new ArrayList<>();
         restockBacklogSlots = new ArrayList<>();
         knownErrors = new ArrayList<>();
-        reset = null;
+        perimeterCorners = new ArrayList<>();
+        resetButton = null;
         mapCorner = null;
         lastInteractedBlockPos = null;
         miningPos = null;
@@ -486,8 +483,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
         closeNextInvPacket = false;
         timeoutTicks = 0;
         interactTimeout = 0;
-        closeResetChestTicks = 0;
+        buttonPressTicks = 0;
+        cornerSelectCooldown = 0;
         toBeSwappedSlot = -1;
+        debugWipeOnly = false;
         oldState = null;
         debugPreviousState = null;
 
@@ -540,16 +539,48 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 int adjustedZ = Utils.getIntervalStart(hitPos.getZ());
                 mapCorner = new BlockPos(adjustedX, hitPos.getY(), adjustedZ);
                 MapAreaCache.reset(mapCorner);
-                state = State.SelectingReset;
-                info("Map Area selected. Press the §aReset Trapped Chest §7used to remove the carpets");
+                state = State.SelectingResetButton;
+                info("Map Area selected. Right-click the §aReset Button §7used to toggle the water (first press to start water, second press to retract).");
                 break;
-            case SelectingReset:
+            case SelectingResetButton:
                 BlockPos blockPos = packet.getBlockHitResult().getBlockPos();
-                if (MapAreaCache.getCachedBlockState(blockPos).getBlock() instanceof TrappedChestBlock) {
-                    reset = new Pair<>(blockPos, mc.player.getEntityPos());
-                    info("Reset Trapped Chest selected. Select the §aCartography Table.");
-                    state = State.SelectingTable;
+                if (MapAreaCache.getCachedBlockState(blockPos).getBlock() instanceof ButtonBlock) {
+                    resetButton = new Pair<>(blockPos, mc.player.getEntityPos());
+                    info("Reset Button selected. Right-click the §a1st Perimeter Corner §7(any block at the first corner).");
+                    state = State.SelectingPerimeterCorner1;
                 }
+                break;
+            case SelectingPerimeterCorner1:
+                if (cornerSelectCooldown > 0) return;
+                blockPos = packet.getBlockHitResult().getBlockPos();
+                perimeterCorners.add(new Pair<>(blockPos, mc.player.getEntityPos()));
+                info("Corner 1 selected. Right-click the §a2nd Perimeter Corner.");
+                cornerSelectCooldown = 20;
+                state = State.SelectingPerimeterCorner2;
+                break;
+            case SelectingPerimeterCorner2:
+                if (cornerSelectCooldown > 0) return;
+                blockPos = packet.getBlockHitResult().getBlockPos();
+                perimeterCorners.add(new Pair<>(blockPos, mc.player.getEntityPos()));
+                info("Corner 2 selected. Right-click the §a3rd Perimeter Corner.");
+                cornerSelectCooldown = 20;
+                state = State.SelectingPerimeterCorner3;
+                break;
+            case SelectingPerimeterCorner3:
+                if (cornerSelectCooldown > 0) return;
+                blockPos = packet.getBlockHitResult().getBlockPos();
+                perimeterCorners.add(new Pair<>(blockPos, mc.player.getEntityPos()));
+                info("Corner 3 selected. Right-click the §a4th Perimeter Corner.");
+                cornerSelectCooldown = 20;
+                state = State.SelectingPerimeterCorner4;
+                break;
+            case SelectingPerimeterCorner4:
+                if (cornerSelectCooldown > 0) return;
+                blockPos = packet.getBlockHitResult().getBlockPos();
+                perimeterCorners.add(new Pair<>(blockPos, mc.player.getEntityPos()));
+                info("Perimeter Corners selected. Select the §aCartography Table.");
+                cornerSelectCooldown = 20;
+                state = State.SelectingTable;
                 break;
             case SelectingTable:
                 blockPos = packet.getBlockHitResult().getBlockPos();
@@ -563,34 +594,16 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 blockPos = packet.getBlockHitResult().getBlockPos();
                 if (MapAreaCache.getCachedBlockState(blockPos).getBlock() instanceof AbstractChestBlock) {
                     finishedMapChest = new Pair<>(blockPos, mc.player.getEntityPos());
-                    info("Finished Map Chest selected. Select all §aMap- and Material-Chests. Interact with the Start Block to start printing.");
+                    info("Finished Map Chest selected. Select all §aMap- and Material-Chests. Type §a.startprinter §7to start printing.");
                     state = State.SelectingChests;
                 }
                 break;
             case SelectingChests:
-                if (startBlocks.get().isEmpty())
-                    warning("No block selected as Start Block! Please select one in the settings.");
                 blockPos = packet.getBlockHitResult().getBlockPos();
                 BlockState blockState = MapAreaCache.getCachedBlockState(blockPos);
                 if (blockState.getBlock().equals(Blocks.CHEST)) {
                     tempChestPos = blockPos;
                     state = State.AwaitRegisterResponse;
-                }
-                if (startBlocks.get().contains(blockState.getBlock())) {
-                    //Check if requirements to start building are met
-                    if (materialDict.isEmpty()) {
-                        warning("No Material Chests selected!");
-                        return;
-                    }
-                    if (mapMaterialChests.isEmpty()) {
-                        warning("No Map Chests selected!");
-                        return;
-                    }
-                    if (!setupSlots()) {
-                        return;
-                    }
-
-                    startBuilding();
                 }
                 break;
         }
@@ -645,7 +658,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         }
 
         List<State> allowedStates = Arrays.asList(State.AwaitRestockResponse, State.AwaitMapChestResponse,
-            State.AwaitCartographyResponse, State.AwaitFinishedMapChestResponse, State.AwaitResetResponse);
+            State.AwaitCartographyResponse, State.AwaitFinishedMapChestResponse);
         if (allowedStates.contains(state)) {
             toBeHandledInvPacket = packet;
             timeoutTicks = preRestockDelay.get();
@@ -754,18 +767,13 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     }
                 }
                 if (breakCarpetAboveReset.get()) {
-                    BlockPos abovePos = reset.getLeft().up();
+                    BlockPos abovePos = resetButton.getLeft().up();
                     if (MapAreaCache.getCachedBlockState(abovePos).getBlock() instanceof CarpetBlock) {
-                        checkpoints.add(new Pair(reset.getRight(), new Pair("break", abovePos)));
+                        checkpoints.add(new Pair(resetButton.getRight(), new Pair("break", abovePos)));
                     }
                 }
-                checkpoints.add(new Pair(reset.getRight(), new Pair("reset", null)));
+                triggerWipeSequence();
                 state = State.Walking;
-                break;
-            case AwaitResetResponse:
-                interactTimeout = 0;
-                closeNextInvPacket = false;
-                closeResetChestTicks = resetChestCloseDelay.get();
                 break;
         }
     }
@@ -794,20 +802,34 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (interactTimeout > 0) {
             interactTimeout--;
             if (interactTimeout == 0) {
-                info("Interaction timed out. Interacting again...");
-                interactWithBlock(lastInteractedBlockPos);
+                // Don't retry if we're waiting for button press confirmation
+                if (state != State.AwaitButtonPress) {
+                    info("Interaction timed out. Interacting again...");
+                    interactWithBlock(lastInteractedBlockPos);
+                }
             }
         }
 
-        if (closeResetChestTicks > 0) {
-            closeResetChestTicks--;
-            if (closeResetChestTicks == 0) {
-                mc.player.closeHandledScreen();
-                Vec3d center = mapCorner.add(map.length / 2, 0, map[0].length / 2).toCenterPos();
-                checkpoints.add(0, new Pair(center, new Pair("awaitClear", null)));
-                state = State.Walking;
-                info("close reset chest");
+        if (cornerSelectCooldown > 0) cornerSelectCooldown--;
+
+        if (state == State.AwaitButtonPress) {
+            // Phase 1: Wait for interaction packet to be sent (interactTimeout reaches 0)
+            if (interactTimeout > 0) {
+                Utils.setForwardPressed(false);
+                Utils.setBackwardPressed(false);
+                Utils.setJumpPressed(false);
+                return;
             }
+            // Phase 2: Now wait for redstone to settle
+            if (buttonPressTicks > 0) {
+                buttonPressTicks--;
+                Utils.setForwardPressed(false);
+                Utils.setBackwardPressed(false);
+                Utils.setJumpPressed(false);
+                return;
+            }
+            state = State.Walking;
+            return;
         }
 
         if (timeoutTicks > 0) {
@@ -870,6 +892,12 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
         // Await map reset
         if (state == State.AwaitAreaClear && MapAreaCache.isMapAreaClear()) {
+            if (debugWipeOnly) {
+                debugWipeOnly = false;
+                info("Debug wipe sequence completed. Map area is clear.");
+                state = State.SelectingChests;
+                return;
+            }
             state = State.AwaitNBTFile;
             return;
         }
@@ -927,12 +955,12 @@ public class CarpetPrinter extends Module implements MapPrinter {
                         warning("ErrorAction is Reset: Resetting map because of an error...");
                         checkpoints.clear();
                         if (breakCarpetAboveReset.get()) {
-                            BlockPos abovePos = reset.getLeft().up();
+                            BlockPos abovePos = resetButton.getLeft().up();
                             if (MapAreaCache.getCachedBlockState(abovePos).getBlock() instanceof CarpetBlock) {
-                                checkpoints.add(new Pair(reset.getRight(), new Pair("break", abovePos)));
+                                checkpoints.add(new Pair(resetButton.getRight(), new Pair("break", abovePos)));
                             }
                         }
-                        checkpoints.add(new Pair(reset.getRight(), new Pair("reset", null)));
+                        triggerWipeSequence();
                         startedFiles.remove(mapFile);
                     }
                     break;
@@ -961,11 +989,11 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     state = State.AwaitFinishedMapChestResponse;
                     interactWithBlock(finishedMapChest.getLeft());
                     return;
-                case "reset":
-                    info("Resetting...");
-                    state = State.AwaitResetResponse;
-                    interactWithBlock(reset.getLeft());
-                    lastInteractedBlockPos = reset.getLeft();
+                case "pressButton":
+                    info("Pressing reset button...");
+                    state = State.AwaitButtonPress;
+                    buttonPressTicks = buttonPressDelay.get();
+                    interactWithBlock(resetButton.getLeft());
                     return;
                 case "dump":
                     state = State.Dumping;
@@ -1295,6 +1323,38 @@ public class CarpetPrinter extends Module implements MapPrinter {
         return true;
     }
 
+    public boolean triggerWipeSequence() {
+        if (resetButton == null || perimeterCorners == null || perimeterCorners.size() < 4 || mapCorner == null) {
+            warning("Cannot trigger wipe sequence: reset button, perimeter corners, or map corner not configured.");
+            return false;
+        }
+        // 1. Press button to start water
+        checkpoints.add(new Pair(resetButton.getRight(), new Pair("pressButton", null)));
+        // 2. Walk perimeter to ensure water clears everything
+        for (Pair<BlockPos, Vec3d> corner : perimeterCorners) {
+            checkpoints.add(new Pair(corner.getRight(), new Pair("", null)));
+        }
+        // 3. Press button again to retract water
+        checkpoints.add(new Pair(resetButton.getRight(), new Pair("pressButton", null)));
+        // 4. Walk perimeter again to ensure all chunks load and water retracts
+        for (Pair<BlockPos, Vec3d> corner : perimeterCorners) {
+            checkpoints.add(new Pair(corner.getRight(), new Pair("", null)));
+        }
+        // 5. Walk to center and check area is clear (map area is always 128x128)
+        Vec3d resetCenter = mapCorner.add(64, 0, 64).toCenterPos();
+        checkpoints.add(new Pair(resetCenter, new Pair("awaitClear", null)));
+        state = State.Walking;
+        return true;
+    }
+
+    public void triggerDebugWipe() {
+        checkpoints.clear();
+        if (triggerWipeSequence()) {
+            debugWipeOnly = true;
+            info("Debug wipe started. Walking to reset button...");
+        }
+    }
+
     // Inventory Management
 
     private boolean setupSlots() {
@@ -1497,6 +1557,25 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
     // MapPrinter Interface for Slave Logic
 
+    public void startPrinting() {
+        if (state != State.SelectingChests) {
+            error("Cannot start printing in the current state. Please complete all registrations first.");
+            return;
+        }
+        if (materialDict.isEmpty()) {
+            warning("No Material Chests selected!");
+            return;
+        }
+        if (mapMaterialChests.isEmpty()) {
+            warning("No Map Chests selected!");
+            return;
+        }
+        if (!setupSlots()) {
+            return;
+        }
+        startBuilding();
+    }
+
     public void setInterval(Pair<Integer, Integer> interval) {
         workingInterval = interval;
     }
@@ -1553,7 +1632,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
             error("No config file name selected.");
             return;
         }
-        if (reset == null || cartographyTable == null || finishedMapChest == null || dumpStation == null || mapCorner == null || materialDict.isEmpty()) {
+        if (resetButton == null || cartographyTable == null || finishedMapChest == null || dumpStation == null || mapCorner == null || materialDict.isEmpty()) {
             error("Cannot save config: Missing required data.");
             return;
         }
@@ -1561,13 +1640,14 @@ public class CarpetPrinter extends Module implements MapPrinter {
             ConfigSerializer.writeToJson(
                 configFile.toPath(),
                 "carpet",
-                reset,
+                resetButton,
                 cartographyTable,
                 finishedMapChest,
                 mapMaterialChests,
                 dumpStation,
                 mapCorner,
-                materialDict);
+                materialDict,
+                perimeterCorners);
             Text configText = Text.literal(configFile.getName())
                 .styled(style -> style
                     .withColor(Formatting.GREEN)
@@ -1586,7 +1666,11 @@ public class CarpetPrinter extends Module implements MapPrinter {
             return false;
         }
         List<State> allowedStates = List.of(
-            State.SelectingReset,
+            State.SelectingResetButton,
+            State.SelectingPerimeterCorner1,
+            State.SelectingPerimeterCorner2,
+            State.SelectingPerimeterCorner3,
+            State.SelectingPerimeterCorner4,
             State.SelectingChests,
             State.SelectingFinishedMapChest,
             State.SelectingDumpStation,
@@ -1607,11 +1691,11 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 error("Config file is of type " + data.type + " and not 'carpet'.");
                 return false;
             }
-            if (data.reset == null || data.cartographyTable == null || data.finishedMapChest == null || data.dumpStation == null || data.mapCorner == null || data.materialDict.isEmpty()) {
+            if (data.resetButton == null || data.cartographyTable == null || data.finishedMapChest == null || data.dumpStation == null || data.mapCorner == null || data.materialDict.isEmpty() || data.perimeterCorners.size() < 4) {
                 error("Config file is missing required data.");
                 return false;
             }
-            this.reset = data.reset;
+            this.resetButton = data.resetButton;
             this.cartographyTable = data.cartographyTable;
             this.finishedMapChest = data.finishedMapChest;
             this.mapMaterialChests = data.mapMaterialChests;
@@ -1619,6 +1703,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
             this.mapCorner = data.mapCorner;
             MapAreaCache.reset(mapCorner);
             this.materialDict = data.materialDict;
+            this.perimeterCorners = (ArrayList<Pair<BlockPos, Vec3d>>) data.perimeterCorners;
             Text configText = Text.literal(configFile.getName())
                 .styled(style -> style
                     .withColor(Formatting.GREEN)
@@ -1626,7 +1711,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     .withHoverEvent(new HoverEvent.ShowText(Text.literal("Open config")))
                     .withUnderline(true));
             info(Text.literal("Successfully loaded config: ").append(configText));
-            info("Interact with the Start Block to start printing.");
+            info("Type .startprinter to start printing.");
             state = State.SelectingChests;
         } catch (IOException e) {
             error("Failed to read config file.");
@@ -1771,9 +1856,16 @@ public class CarpetPrinter extends Module implements MapPrinter {
         }
 
         if (renderSpecialInteractions.get()) {
-            if (reset != null) {
-                event.renderer.box(reset.getLeft(), color.get(), color.get(), ShapeMode.Lines, 0);
-                event.renderer.box(reset.getRight().x - indicatorSize.get(), reset.getRight().y - indicatorSize.get(), reset.getRight().z - indicatorSize.get(), reset.getRight().getX() + indicatorSize.get(), reset.getRight().getY() + indicatorSize.get(), reset.getRight().getZ() + indicatorSize.get(), color.get(), color.get(), ShapeMode.Both, 0);
+            if (resetButton != null) {
+                event.renderer.box(resetButton.getLeft(), color.get(), color.get(), ShapeMode.Lines, 0);
+                event.renderer.box(resetButton.getRight().x - indicatorSize.get(), resetButton.getRight().y - indicatorSize.get(), resetButton.getRight().z - indicatorSize.get(), resetButton.getRight().getX() + indicatorSize.get(), resetButton.getRight().getY() + indicatorSize.get(), resetButton.getRight().getZ() + indicatorSize.get(), color.get(), color.get(), ShapeMode.Both, 0);
+            }
+            if (perimeterCorners != null) {
+                for (int i = 0; i < perimeterCorners.size(); i++) {
+                    Pair<BlockPos, Vec3d> corner = perimeterCorners.get(i);
+                    event.renderer.box(corner.getLeft(), color.get(), color.get(), ShapeMode.Lines, 0);
+                    event.renderer.box(corner.getRight().x - indicatorSize.get(), corner.getRight().y - indicatorSize.get(), corner.getRight().z - indicatorSize.get(), corner.getRight().getX() + indicatorSize.get(), corner.getRight().getY() + indicatorSize.get(), corner.getRight().getZ() + indicatorSize.get(), color.get(), color.get(), ShapeMode.Both, 0);
+                }
             }
             if (cartographyTable != null) {
                 event.renderer.box(cartographyTable.getLeft(), color.get(), color.get(), ShapeMode.Lines, 0);
@@ -1792,7 +1884,11 @@ public class CarpetPrinter extends Module implements MapPrinter {
     // Enums
 
     private enum State {
-        SelectingReset,
+        SelectingResetButton,
+        SelectingPerimeterCorner1,
+        SelectingPerimeterCorner2,
+        SelectingPerimeterCorner3,
+        SelectingPerimeterCorner4,
         SelectingChests,
         SelectingFinishedMapChest,
         SelectingDumpStation,
@@ -1800,7 +1896,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         SelectingMapArea,
         AwaitRegisterResponse,
         AwaitRestockResponse,
-        AwaitResetResponse,
+        AwaitButtonPress,
         AwaitMapChestResponse,
         AwaitFinishedMapChestResponse,
         AwaitCartographyResponse,

@@ -1,5 +1,7 @@
 package com.julflips.nerv_printer;
 
+import com.julflips.nerv_printer.commands.DebugWipeCommand;
+import com.julflips.nerv_printer.commands.StartPrinterCommand;
 import com.julflips.nerv_printer.modules.CarpetPrinter;
 import com.julflips.nerv_printer.modules.MapNamer;
 import com.julflips.nerv_printer.modules.StaircasedPrinter;
@@ -9,6 +11,7 @@ import com.julflips.nerv_printer.utils.Utils;
 import com.mojang.logging.LogUtils;
 import meteordevelopment.meteorclient.MeteorClient;
 import meteordevelopment.meteorclient.addons.MeteorAddon;
+import meteordevelopment.meteorclient.commands.Commands;
 import meteordevelopment.meteorclient.systems.modules.Category;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import org.slf4j.Logger;
@@ -29,6 +32,10 @@ public class Addon extends MeteorAddon {
         Modules.get().add(new CarpetPrinter());
         Modules.get().add(new StaircasedPrinter());
         Modules.get().add(new MapNamer());
+
+        // Commands
+        Commands.add(new StartPrinterCommand());
+        Commands.add(new DebugWipeCommand());
     }
 
     @Override

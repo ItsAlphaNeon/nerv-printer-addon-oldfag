@@ -49,7 +49,7 @@ public final class ConfigDeserializer {
      */
     public static class ConfigData {
         public String type;
-        public Pair<BlockPos, Vec3d> reset;
+        public Pair<BlockPos, Vec3d> resetButton;
         public Pair<BlockPos, Vec3d> cartographyTable;
         public Pair<BlockPos, Vec3d> finishedMapChest;
         public Pair<BlockPos, Vec3d> usedToolChest;
@@ -59,6 +59,7 @@ public final class ConfigDeserializer {
         public BlockPos mapCorner;
         public HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict;
         public Set<ItemStack> toolSet;
+        public ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners;
     }
 
     private static JsonObject getObj(JsonObject root, String key) {
@@ -77,8 +78,8 @@ public final class ConfigDeserializer {
             data.type = root.get("type").getAsString();
 
             JsonObject obj;
-            obj = getObj(root, "reset");
-            data.reset = obj != null ? jsonToBlockPosVecPair(obj) : null;
+            obj = getObj(root, "resetButton");
+            data.resetButton = obj != null ? jsonToBlockPosVecPair(obj) : null;
             obj = getObj(root, "cartographyTable");
             data.cartographyTable = obj != null ? jsonToBlockPosVecPair(obj) : null;
             obj = getObj(root, "finishedMapChest");
@@ -132,6 +133,15 @@ public final class ConfigDeserializer {
                     Identifier id = Identifier.of(o.get("item").getAsString());
                     data.toolSet.add(
                         new ItemStack(Registries.ITEM.get(id))
+                    );
+                }
+            }
+
+            data.perimeterCorners = new ArrayList<>();
+            if (root.has("perimeterCorners")) {
+                for (JsonElement e : root.getAsJsonArray("perimeterCorners")) {
+                    data.perimeterCorners.add(
+                        jsonToBlockPosVecPair(e.getAsJsonObject())
                     );
                 }
             }
