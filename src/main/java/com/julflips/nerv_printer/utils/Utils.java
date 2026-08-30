@@ -341,9 +341,9 @@ public final class Utils {
             .thenComparing(File::getName));                // then sort alphabetically
 
         for (File file : files) {
-            // Only check if file was used if not moving to finished folder
-            // since they are not in the map folder in that case
-            if ((!startedFiles.contains(file) || areMoved) &&
+            // Always skip files that were already processed, even when moving to the finished folder:
+            // if the rename in endBuilding() failed, the file would otherwise be re-selected forever.
+            if (!startedFiles.contains(file) &&
                 file.isFile() && file.getName().toLowerCase().endsWith(".nbt")) {
                 startedFiles.add(file);
                 return file;

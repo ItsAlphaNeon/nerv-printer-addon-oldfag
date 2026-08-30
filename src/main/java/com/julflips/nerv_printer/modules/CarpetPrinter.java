@@ -32,18 +32,23 @@ import net.minecraft.nbt.NbtSizeTracker;
 import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerInteractBlockC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerInteractItemC2SPacket;
+import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
+import net.minecraft.network.packet.s2c.play.BlockUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.InventoryS2CPacket;
 import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.ClickEvent;
 import net.minecraft.text.HoverEvent;
 import net.minecraft.text.Text;
+import net.minecraft.util.ActionResult;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Pair;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
 import org.apache.commons.lang3.tuple.Triple;
 import org.lwjgl.util.tinyfd.TinyFileDialogs;
 
@@ -235,6 +240,15 @@ public class CarpetPrinter extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<Integer> buttonPressRetries = sgAdvanced.add(new IntSetting.Builder()
+        .name("button-press-retries")
+        .description("How many times to retry the reset button press if it was not confirmed via a block update.")
+        .defaultValue(3)
+        .min(0)
+        .sliderRange(0, 10)
+        .build()
+    );
+
     private final Setting<Integer> retryInteractTimer = sgAdvanced.add(new IntSetting.Builder()
         .name("retry-interact-timer")
         .description("How many ticks to wait for chest response before interacting with it again.")
@@ -414,10 +428,14 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
     int timeoutTicks;
     int buttonPressTicks;
+    int buttonPressAttempts;
     int cornerSelectCooldown;
     int interactTimeout;
     int toBeSwappedSlot;
+    int awaitClearLogTicks;
     boolean debugWipeOnly;
+    boolean expectButtonPress;
+    boolean isWiping;
     long lastTickTime;
     boolean closeNextInvPacket;
     State state;
@@ -484,9 +502,13 @@ public class CarpetPrinter extends Module implements MapPrinter {
         timeoutTicks = 0;
         interactTimeout = 0;
         buttonPressTicks = 0;
+        buttonPressAttempts = 0;
         cornerSelectCooldown = 0;
         toBeSwappedSlot = -1;
+        awaitClearLogTicks = 0;
         debugWipeOnly = false;
+        expectButtonPress = false;
+        isWiping = false;
         oldState = null;
         debugPreviousState = null;
 
@@ -616,6 +638,18 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (event.packet instanceof PlayerPositionLookS2CPacket) {
             timeoutTicks = posResetTimeout.get();
             if (timeoutTicks > 0) Utils.setForwardPressed(false);
+        }
+
+        // Confirm reset button presses via block updates (the server sends one when the button pulses)
+        if (event.packet instanceof BlockUpdateS2CPacket blockUpdate) {
+            if (state == State.AwaitButtonPress && expectButtonPress && resetButton != null
+                && blockUpdate.getPos().equals(resetButton.getLeft())) {
+                BlockState blockState = blockUpdate.getState();
+                if (blockState.getBlock() instanceof ButtonBlock && blockState.get(ButtonBlock.POWERED)) {
+                    expectButtonPress = false;
+                    if (debugPrints.get()) info("Reset button press confirmed via block update.");
+                }
+            }
         }
 
         if (!(event.packet instanceof InventoryS2CPacket packet)) return;
@@ -772,7 +806,11 @@ public class CarpetPrinter extends Module implements MapPrinter {
                         checkpoints.add(new Pair(resetButton.getRight(), new Pair("break", abovePos)));
                     }
                 }
-                triggerWipeSequence();
+                if (!triggerWipeSequence()) {
+                    warning("Cannot start the wipe sequence (missing reset button/perimeter corners). Moving to the next map...");
+                    state = State.AwaitNBTFile;
+                    break;
+                }
                 state = State.Walking;
                 break;
         }
@@ -813,21 +851,27 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (cornerSelectCooldown > 0) cornerSelectCooldown--;
 
         if (state == State.AwaitButtonPress) {
-            // Phase 1: Wait for interaction packet to be sent (interactTimeout reaches 0)
-            if (interactTimeout > 0) {
-                Utils.setForwardPressed(false);
-                Utils.setBackwardPressed(false);
-                Utils.setJumpPressed(false);
-                return;
-            }
-            // Phase 2: Now wait for redstone to settle
+            // Wait for the button press to be confirmed (via BlockUpdateS2CPacket) and redstone to settle.
             if (buttonPressTicks > 0) {
                 buttonPressTicks--;
+                if (!expectButtonPress) {
+                    // Press was confirmed - keep waiting for the redstone to settle
+                } else if (buttonPressTicks == 0 && buttonPressAttempts < buttonPressRetries.get()) {
+                    // Not confirmed and retries remaining - press the button again
+                    buttonPressAttempts++;
+                    buttonPressTicks = buttonPressDelay.get();
+                    info("Reset button press not confirmed. Retrying (" + buttonPressAttempts + "/" + buttonPressRetries.get() + ")...");
+                    pressResetButton();
+                } else if (buttonPressTicks == 0) {
+                    warning("Reset button press could not be confirmed after " + (buttonPressAttempts + 1) + " attempts. Continuing anyway...");
+                    buttonPressAttempts = 0;
+                }
                 Utils.setForwardPressed(false);
                 Utils.setBackwardPressed(false);
                 Utils.setJumpPressed(false);
                 return;
             }
+            buttonPressAttempts = 0;
             state = State.Walking;
             return;
         }
@@ -894,12 +938,23 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (state == State.AwaitAreaClear && MapAreaCache.isMapAreaClear()) {
             if (debugWipeOnly) {
                 debugWipeOnly = false;
+                isWiping = false;
                 info("Debug wipe sequence completed. Map area is clear.");
                 state = State.SelectingChests;
                 return;
             }
             state = State.AwaitNBTFile;
             return;
+        }
+        if (state == State.AwaitAreaClear) {
+            // Throttled log so a stuck wipe is diagnosable
+            if (awaitClearLogTicks > 0) {
+                awaitClearLogTicks--;
+            } else {
+                awaitClearLogTicks = 100;
+                if (debugPrints.get())
+                    info("Waiting for the map area to clear... (if this takes too long, the reset button presses probably missed and the water state is wrong)");
+            }
         }
 
         // Load next nbt file
@@ -926,6 +981,14 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (!state.equals(State.Walking)) return;
         Utils.setForwardPressed(true);
         if (checkpoints.isEmpty()) {
+            if (isWiping) {
+                // The wipe checkpoint queue ran out - never fall back to building with the previous map here
+                warning("Wipe checkpoint queue ran out unexpectedly. Waiting for the map area to clear...");
+                isWiping = false;
+                state = State.AwaitAreaClear;
+                Utils.setForwardPressed(false);
+                return;
+            }
             // Creating fallback checkpoint
             checkpoints.add(new Pair(mc.player.getEntityPos(), new Pair<>("lineEnd", null)));
         }
@@ -960,7 +1023,11 @@ public class CarpetPrinter extends Module implements MapPrinter {
                                 checkpoints.add(new Pair(resetButton.getRight(), new Pair("break", abovePos)));
                             }
                         }
-                        triggerWipeSequence();
+                        if (!triggerWipeSequence()) {
+                            warning("Cannot start the wipe sequence (missing reset button/perimeter corners). Stopping the module to avoid building on a dirty canvas...");
+                            toggle();
+                            return;
+                        }
                         startedFiles.remove(mapFile);
                     }
                     break;
@@ -993,7 +1060,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     info("Pressing reset button...");
                     state = State.AwaitButtonPress;
                     buttonPressTicks = buttonPressDelay.get();
-                    interactWithBlock(resetButton.getLeft());
+                    buttonPressAttempts = 0;
+                    pressResetButton();
                     return;
                 case "dump":
                     state = State.Dumping;
@@ -1074,6 +1142,9 @@ public class CarpetPrinter extends Module implements MapPrinter {
         }
         final List<String> allowPlaceActions = Arrays.asList("", "lineEnd", "sprint");
         if (!allowPlaceActions.contains(nextAction)) return;
+        // Never place blocks or inject restock checkpoints while the wipe sequence is running -
+        // the map data is still the previous map and the canvas is being cleared.
+        if (isWiping) return;
 
         ArrayList<BlockPos> placements = new ArrayList<>();
         for (int i = 0; i < allowedPlacements; i++) {
@@ -1221,6 +1292,69 @@ public class CarpetPrinter extends Module implements MapPrinter {
         lastInteractedBlockPos = blockPos;
     }
 
+    // Returns a position ~1.8 blocks away from the button center, on the same approach direction
+    // the user used when registering the button. This guarantees the click is within the server's
+    // interaction range even if the registration position was near the reach limit.
+    private Vec3d getSafeButtonPressPos() {
+        Vec3d center = resetButton.getLeft().toCenterPos();
+        Vec3d registered = resetButton.getRight();
+        Vec3d dir = registered.subtract(center);
+        double len = dir.length();
+        if (len < 0.1) return new Vec3d(center.x, registered.y, center.z + 1.8);
+        return center.add(dir.multiply(1.8 / len));
+    }
+
+    // Sends a right click on the reset button as close to vanilla as possible:
+    // 1. Rotate to the button and sync the rotation with the server via a look packet.
+    // 2. Compute the hit point with a vanilla-style raycast against the button hitbox.
+    // 3. Only send the click if the hit point is within the server's interaction range.
+    // 4. Send the click through the interaction manager and swing on accept.
+    // The press is then confirmed via BlockUpdateS2CPacket in onReceivePacket and retried
+    // in the AwaitButtonPress state if no confirmation arrives.
+    private void pressResetButton() {
+        Utils.setForwardPressed(false);
+        mc.player.setVelocity(0, 0, 0);
+        interactTimeout = 0;
+
+        BlockPos buttonPos = resetButton.getLeft();
+        Vec3d eyePos = mc.player.getEyePos();
+        Vec3d buttonCenter = buttonPos.toCenterPos();
+
+        // 1. Rotate to the button and sync the rotation with the server
+        float yaw = (float) Rotations.getYaw(buttonCenter);
+        float pitch = (float) Rotations.getPitch(buttonCenter);
+        mc.player.setYaw(yaw);
+        mc.player.setPitch(pitch);
+        mc.getNetworkHandler().sendPacket(new PlayerMoveC2SPacket.LookAndOnGround(yaw, pitch, mc.player.isOnGround(), mc.player.horizontalCollision));
+
+        // 2. Vanilla-style raycast to find the exact hit point on the button hitbox
+        double reach = mc.player.isCreative() ? 5.0 : 4.5;
+        Vec3d lookVec = mc.player.getRotationVec(1.0f);
+        BlockHitResult hit = mc.world.raycast(new RaycastContext(eyePos, eyePos.add(lookVec.multiply(reach)),
+            RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, mc.player));
+        if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(buttonPos)) {
+            // Raycast missed (e.g. obstruction) - fall back to the button center with the closest side
+            hit = new BlockHitResult(buttonCenter, Utils.getInteractionSide(buttonPos), buttonPos, false);
+        }
+
+        // 3. Only send the click if the hit point is within the server's interaction range
+        if (eyePos.squaredDistanceTo(hit.getPos()) > (reach - 0.2) * (reach - 0.2)) {
+            warning("Reset button out of reach. Walking closer...");
+            Vec3d closer = buttonCenter.add(eyePos.subtract(buttonCenter).normalize().multiply(1.5));
+            checkpoints.add(0, new Pair(new Vec3d(closer.x, mc.player.getY(), closer.z), new Pair("pressButton", null)));
+            state = State.Walking;
+            return;
+        }
+
+        // 4. Vanilla right click
+        ActionResult result = mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
+        if (result.isAccepted()) mc.player.swingHand(Hand.MAIN_HAND);
+
+        // 5. Arm the confirmation (BlockUpdateS2CPacket will clear expectButtonPress)
+        expectButtonPress = true;
+        lastInteractedBlockPos = buttonPos;
+    }
+
     private boolean tryPlacingBlock(BlockPos pos) {
         BlockPos relativePos = pos.subtract(mapCorner);
         Item material = map[relativePos.getX()][relativePos.getZ()].asItem();
@@ -1299,6 +1433,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (!SlaveSystem.isSlave()) SlaveSystem.startAllSlaves();
         if (availableSlots.isEmpty()) setupSlots();
         MapAreaCache.reset(mapCorner);
+        isWiping = false;
         calculateBuildingPath(startNorthToSouth.get(), true);
         checkpoints.add(0, new Pair(dumpStation.getLeft(), new Pair("dump", null)));
         state = State.Walking;
@@ -1314,8 +1449,14 @@ public class CarpetPrinter extends Module implements MapPrinter {
         checkpoints.add(new Pair(dumpStation.getLeft(), new Pair("dump", null)));
         checkpoints.add(new Pair(bestChest.getRight(), new Pair("mapMaterialChest", bestChest.getLeft())));
         try {
-            if (moveToFinishedFolder.get())
-                mapFile.renameTo(new File(mapFile.getParentFile().getAbsolutePath() + File.separator + "_finished_maps" + File.separator + mapFile.getName()));
+            if (moveToFinishedFolder.get()) {
+                File finishedFile = new File(mapFile.getParentFile().getAbsolutePath() + File.separator + "_finished_maps" + File.separator + mapFile.getName());
+                if (mapFile.renameTo(finishedFile)) {
+                    info("Moved finished map to _finished_maps: §a" + mapFile.getName());
+                } else {
+                    warning("Failed to move map file " + mapFile.getName() + " to finished map folder. It will be skipped on the next map selection.");
+                }
+            }
         } catch (Exception e) {
             warning("Failed to move map file " + mapFile.getName() + " to finished map folder");
             e.printStackTrace();
@@ -1328,21 +1469,24 @@ public class CarpetPrinter extends Module implements MapPrinter {
             warning("Cannot trigger wipe sequence: reset button, perimeter corners, or map corner not configured.");
             return false;
         }
+        // Ensure the bot stops within reach of the button for both presses
+        Vec3d pressPos = getSafeButtonPressPos();
         // 1. Press button to start water
-        checkpoints.add(new Pair(resetButton.getRight(), new Pair("pressButton", null)));
+        checkpoints.add(new Pair(pressPos, new Pair("pressButton", null)));
         // 2. Walk perimeter to ensure water clears everything
         for (Pair<BlockPos, Vec3d> corner : perimeterCorners) {
-            checkpoints.add(new Pair(corner.getRight(), new Pair("", null)));
+            checkpoints.add(new Pair(corner.getRight(), new Pair("wipe", null)));
         }
         // 3. Press button again to retract water
-        checkpoints.add(new Pair(resetButton.getRight(), new Pair("pressButton", null)));
+        checkpoints.add(new Pair(pressPos, new Pair("pressButton", null)));
         // 4. Walk perimeter again to ensure all chunks load and water retracts
         for (Pair<BlockPos, Vec3d> corner : perimeterCorners) {
-            checkpoints.add(new Pair(corner.getRight(), new Pair("", null)));
+            checkpoints.add(new Pair(corner.getRight(), new Pair("wipe", null)));
         }
         // 5. Walk to center and check area is clear (map area is always 128x128)
         Vec3d resetCenter = mapCorner.add(64, 0, 64).toCenterPos();
         checkpoints.add(new Pair(resetCenter, new Pair("awaitClear", null)));
+        isWiping = true;
         state = State.Walking;
         return true;
     }

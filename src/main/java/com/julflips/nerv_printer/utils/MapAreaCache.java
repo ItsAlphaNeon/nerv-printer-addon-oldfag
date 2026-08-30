@@ -26,7 +26,19 @@ public final class MapAreaCache {
     public static boolean isMapAreaClear() {
         for (int x = 0; x < 128; x++) {
             for (int z = 0; z < 128; z++) {
-                BlockState blockState = mc.world.getBlockState(mapCorner.add(x, 0, z));
+                BlockPos pos = mapCorner.add(x, 0, z);
+                int chunkX = pos.getX() >> 4;
+                int chunkZ = pos.getZ() >> 4;
+                BlockState blockState;
+                if (mc.world.getChunkManager().isChunkLoaded(chunkX, chunkZ)) {
+                    blockState = mc.world.getBlockState(pos);
+                } else {
+                    // Chunk is unloaded - use the last known state if it was cached while the map
+                    // area was tracked, otherwise we cannot verify the area is clear, so keep waiting
+                    Chunk chunk = cachedChunks.get(new ChunkPos(chunkX, chunkZ));
+                    if (chunk == null) return false;
+                    blockState = chunk.getBlockState(pos);
+                }
                 if (!blockState.isAir() || !blockState.getFluidState().isEmpty()) return false;
             }
         }
