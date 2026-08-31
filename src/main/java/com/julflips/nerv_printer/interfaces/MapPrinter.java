@@ -33,7 +33,9 @@ public interface MapPrinter {
 
     void applySetup(String json);
 
-    void applyMapData(String fileName, String base64);
+    void applyMapData(String message);
+
+    void resendMap(String slave);
 
     void goToCorner(int cornerIndex);
 

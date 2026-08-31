@@ -100,6 +100,7 @@ public final class SlaveSystem {
             slaves.removeIf(n -> n.equals(slave));
             activeSlavesDict.remove(slave);
             finishedSlavesDict.remove(slave);
+            HiveLog.log("HEAL dropped stale registration: " + slave);
             ChatUtils.warning("Dropping stale slave registration: " + slave);
         }
         generateIntervals();
@@ -204,11 +205,13 @@ public final class SlaveSystem {
     public static void onServerStarted() {
         serverStarted = true;
         serverRetryTimer = 0;
+        HiveLog.log("SOCKET server started on port " + masterPort);
     }
 
     /** Called from the WebSocket server thread when a server-level error occurs (e.g. bind failure). */
     public static void onServerError(String message) {
         serverStarted = false;
+        HiveLog.log("SOCKET server FAILED: " + message + " (retrying every 5s)");
         mc.execute(() -> ChatUtils.warning("Socket server failed: " + message
             + " - is another instance still hosting on port " + masterPort + "? Retrying every 5s..."));
     }
@@ -222,6 +225,7 @@ public final class SlaveSystem {
                 activeSlavesDict.remove(name);
                 finishedSlavesDict.remove(name);
                 toBeConfirmedSlaves.remove(name);
+                HiveLog.log("DISCONNECT " + name + " (registered slaves left: " + slaves.size() + ")");
                 ChatUtils.info("Slave disconnected: " + name);
                 generateIntervals();
                 if (tableController != null) tableController.rebuild();
@@ -273,6 +277,12 @@ public final class SlaveSystem {
         if (split.length < 3) return;
         String sender = split[1];
         String content = split[2];
+        if (conn != null) {
+            // A slave is talking to us - this (and only this) activates the log file
+            HiveLog.enable();
+        }
+        // Log every slave -> master wire message (payload truncated for map/config transfers)
+        HiveLog.logMessage("IN ", sender, content);
         mc.execute(() -> {
             if (printerModule == null) return;
             if (conn != null && !slaveConnections.containsKey(conn)) {
@@ -290,6 +300,11 @@ public final class SlaveSystem {
     }
 
     private static void sendToSocket(WebSocket conn, String message) {
+        // Single funnel for ALL master -> slave traffic: log every command here
+        HiveLog.logMessage("OUT", slaveConnections.get(conn), message);
+        // The game can be shutting down (player already gone) while a socket
+        // close event still triggers sends - drop them instead of crashing.
+        if (mc.player == null) return;
         conn.send("m:" + mc.player.getName().getString() + ":" + message);
     }
 
@@ -317,6 +332,8 @@ public final class SlaveSystem {
                 return;
             }
         }
+        // Master-side send to a slave we no longer have a socket for - likely lost
+        HiveLog.log("WARN send to " + recipient + " failed: no open connection (msg: " + message + ")");
     }
 
     public static boolean allSlavesFinished() {
@@ -334,6 +351,11 @@ public final class SlaveSystem {
 
     public static boolean isSlave() {
         return master != null;
+    }
+
+    /** True while a printer module is using the hivemind system (used by HiveLog). */
+    public static boolean isHiveActive() {
+        return printerModule != null;
     }
 
     public static void sendToAllSlaves(String message) {
@@ -362,6 +384,25 @@ public final class SlaveSystem {
             printerModule.toggle();
     }
 
+    /** Pauses the whole hivemind: the master pauses in place, every slave receives "pause". */
+    public static void pauseHive() {
+        if (printerModule == null) return;
+        HiveLog.log("HIVE PAUSE requested (slaves: " + slaves.size() + ")");
+        printerModule.pause();
+        sendToAllSlaves("pause");
+        for (String slave : activeSlavesDict.keySet()) {
+            activeSlavesDict.put(slave, false);
+        }
+    }
+
+    /** Resumes the whole hivemind: the master resumes its paused state, slaves receive "start". */
+    public static void resumeHive() {
+        if (printerModule == null) return;
+        HiveLog.log("HIVE RESUME requested (slaves: " + slaves.size() + ")");
+        printerModule.start();
+        startAllSlaves();
+    }
+
     public static void skipNextBuilding() {
         sendToAllSlaves("skip");
         if (printerModule != null) printerModule.skipBuilding();
@@ -380,16 +421,22 @@ public final class SlaveSystem {
         }
         Collections.reverse(intervals);
 
-        printerModule.setInterval(intervals.remove((intervals.size() - 1) / 2));
+        Pair<Integer, Integer> printerModuleInterval = intervals.remove((intervals.size() - 1) / 2);
+        printerModule.setInterval(printerModuleInterval);
 
         // Sort slaves deterministically
         ArrayList<String> sortedSlaves = new ArrayList<>(slaves);
         Collections.sort(sortedSlaves, String.CASE_INSENSITIVE_ORDER);
 
+        StringBuilder assignment = new StringBuilder("INTERVALS reassigned -> master: rows "
+            + printerModuleInterval.getLeft() + "-" + printerModuleInterval.getRight());
         for (int i = 0; i < intervals.size(); i++) {
             String slave = sortedSlaves.get(i);
+            assignment.append(", ").append(slave).append(": rows ")
+                .append(intervals.get(i).getLeft()).append("-").append(intervals.get(i).getRight());
             SlaveSystem.queueDM(slave, "interval:" + intervals.get(i).getLeft() + ":" + intervals.get(i).getRight());
         }
+        HiveLog.log(assignment.toString());
 
         // Hivemind: parked (already finished) slaves may have received new rows -
         // re-activate them so the re-split rows actually get built.
@@ -563,9 +610,7 @@ public final class SlaveSystem {
                 return;
             }
             if (content.startsWith("map:")) {
-                String[] mapSplit = content.substring("map:".length()).split(":", 2);
-                if (mapSplit.length < 2) return;
-                printerModule.applyMapData(mapSplit[0], mapSplit[1]);
+                printerModule.applyMapData(content.substring("map:".length()));
                 return;
             }
         }
@@ -603,6 +648,10 @@ public final class SlaveSystem {
                 case "skip":
                     printerModule.skipBuilding();
                     break;
+                case "remap":
+                    // Slave's map transfer was incomplete/corrupt - re-send it
+                    printerModule.resendMap(sender);
+                    break;
                 case "mine":
                     if (colonSplit.length < 2) break;
                     printerModule.mineLine(Integer.valueOf(colonSplit[1]));
@@ -624,6 +673,7 @@ public final class SlaveSystem {
                     activeSlavesDict.put(sender, false);
                     toBeConfirmedSlaves.remove(sender);
                     ChatUtils.info("Registered slave: " + sender + " Total slaves: " + slaves.size());
+                    HiveLog.log("REGISTER " + sender + " (total slaves: " + slaves.size() + ")");
                     generateIntervals();
                     printerModule.slaveRegistered(sender);
                     if (tableController != null) tableController.rebuild();
@@ -631,12 +681,15 @@ public final class SlaveSystem {
                 case "finished":
                     finishedSlavesDict.put(sender, true);
                     activeSlavesDict.put(sender, false);
+                    HiveLog.log("FINISHED " + sender + " (finished: "
+                        + Collections.frequency(finishedSlavesDict.values(), true) + "/" + finishedSlavesDict.size() + ")");
                     printerModule.slaveFinished(sender);
                     if (tableController != null) tableController.rebuild();
                     break;
                 case "error":
                     if (colonSplit.length < 3) break;
                     BlockPos relativeErrorPos = new BlockPos(Integer.valueOf(colonSplit[1]), 0, Integer.valueOf(colonSplit[2]));
+                    HiveLog.log("ERROR " + sender + " reported failed block at rel " + relativeErrorPos.getX() + "," + relativeErrorPos.getZ());
                     printerModule.addError(relativeErrorPos);
                     break;
             }

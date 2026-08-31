@@ -1818,7 +1818,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     public void applySetup(String json) {
     }
 
-    public void applyMapData(String fileName, String base64) {
+    public void applyMapData(String message) {
+    }
+
+    public void resendMap(String slave) {
     }
 
     public void goToCorner(int cornerIndex) {

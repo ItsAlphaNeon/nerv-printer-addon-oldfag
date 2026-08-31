@@ -1,6 +1,8 @@
 package com.julflips.nerv_printer;
 
 import com.julflips.nerv_printer.commands.DebugWipeCommand;
+import com.julflips.nerv_printer.commands.PausePrintCommand;
+import com.julflips.nerv_printer.commands.ResumePrintCommand;
 import com.julflips.nerv_printer.commands.StartPrinterCommand;
 import com.julflips.nerv_printer.modules.CarpetPrinter;
 import com.julflips.nerv_printer.modules.MapNamer;
@@ -36,6 +38,8 @@ public class Addon extends MeteorAddon {
         // Commands
         Commands.add(new StartPrinterCommand());
         Commands.add(new DebugWipeCommand());
+        Commands.add(new PausePrintCommand());
+        Commands.add(new ResumePrintCommand());
     }
 
     @Override

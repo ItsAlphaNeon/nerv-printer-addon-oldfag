@@ -836,6 +836,18 @@ public class CarpetPrinter extends Module implements MapPrinter {
     private void onTick(TickEvent.Pre event) {
         if (state == null) return;
 
+        // Map chunk reception watchdog (slave): if a chunked map transfer stalls
+        // (chunk never arrived), ask the master to re-send the whole map.
+        // The partial buffer is kept so the re-send only has to fill gaps.
+        if (pendingMapName != null && pendingMapChunks.size() < pendingMapTotal) {
+            if (++pendingMapStallTicks > 100) {
+                pendingMapStallTicks = 0;
+                requestRemap(pendingMapName, "stalled at " + pendingMapChunks.size() + "/" + pendingMapTotal + " chunks");
+            }
+        } else {
+            pendingMapStallTicks = 0;
+        }
+
         if (!state.equals(debugPreviousState)) {
             debugPreviousState = state;
             if (debugPrints.get()) info("State changed to: §a" + state);
@@ -1497,7 +1509,13 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     private void startBuilding() {
+        if (map == null || mapCorner == null) {
+            warning("Cannot start building: no map loaded or no map area selected.");
+            return;
+        }
         finalizePhase = false;
+        HiveLog.log("MAP START " + (mapFile != null ? mapFile.getName() : "<none>")
+            + " (slaves: " + SlaveSystem.slaves.size() + ", finalize phase off)");
         if (!SlaveSystem.isSlave()) {
             // Hivemind: (re-)transmit the map to every registered slave, then start them
             if (hasFullSetup() && mapFile != null) {
@@ -1519,6 +1537,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
         info("Finished building map");
         finalizePhase = true;
         cornerCounter = 0;
+        HiveLog.log("MAP FINISHED " + (mapFile != null ? mapFile.getName() : "<none>")
+            + " - finalize phase ON (master-only dump/cartography/wipe)");
         state = State.Walking;
         knownErrors.clear();
         SlaveSystem.setAllSlavesUnfinished();
@@ -1780,6 +1800,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
     // MapPrinter Interface for Slave Logic
 
     public void startPrinting() {
+        if (!isActive()) {
+            error("Enable the Carpet Printer module first (it auto-disables when no NBT map files are available).");
+            return;
+        }
         if (state != State.SelectingChests) {
             error("Cannot start printing in the current state. Please complete all registrations first.");
             return;
@@ -1790,6 +1814,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
         }
         if (mapMaterialChests.isEmpty()) {
             warning("No Map Chests selected!");
+            return;
+        }
+        if (map == null || mapFile == null) {
+            warning("No map NBT loaded - put a map file into the map folder and re-enable the module.");
             return;
         }
         if (!setupSlots()) {
@@ -1858,6 +1886,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (perimeterCorners.isEmpty()) return;
         int corner = cornerCounter % perimeterCorners.size();
         cornerCounter++;
+        HiveLog.log("PARK " + slave + " -> perimeter corner " + (corner + 1) + " (corner " + corner + ")");
         SlaveSystem.queueDM(slave, "goToCorner:" + corner);
     }
 
@@ -1919,11 +1948,30 @@ public class CarpetPrinter extends Module implements MapPrinter {
     private void sendMapTo(String slave) {
         try {
             byte[] bytes = java.nio.file.Files.readAllBytes(mapFile.toPath());
-            SlaveSystem.queueDM(slave, "map:" + mapFile.getName() + ":" + Base64.getEncoder().encodeToString(bytes));
+            long crc = crc32(bytes);
+            String b64 = Base64.getEncoder().encodeToString(bytes);
+            // Chunked transfer: one giant frame proved unreliable on some slave
+            // connections (arrived truncated -> corrupt NBT). Smaller chunks with
+            // a CRC let the slave verify and request a re-send.
+            int chunkSize = 300000;
+            int total = (b64.length() + chunkSize - 1) / chunkSize;
+            HiveLog.log("MAP SEND " + mapFile.getName() + " to " + slave + ": " + bytes.length
+                + " bytes, crc " + crc + ", " + total + " chunk(s)");
+            for (int i = 0; i < total; i++) {
+                int from = i * chunkSize;
+                int to = Math.min(b64.length(), from + chunkSize);
+                SlaveSystem.queueDM(slave, "map:" + mapFile.getName() + ":" + crc + ":" + total + ":" + i + ":" + b64.substring(from, to));
+            }
         } catch (Exception e) {
             warning("Failed to read map file for transmission: " + mapFile.getName());
             e.printStackTrace();
         }
+    }
+
+    private static long crc32(byte[] bytes) {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(bytes);
+        return crc.getValue();
     }
 
     @Override
@@ -1954,24 +2002,103 @@ public class CarpetPrinter extends Module implements MapPrinter {
         }
     }
 
+    // Chunked map reception state (slave side)
+    private final HashMap<Integer, String> pendingMapChunks = new HashMap<>();
+    private String pendingMapName = null;
+    private int pendingMapTotal = -1;
+    private long pendingMapCrc = -1;
+    private long loadedMapCrc = -1;
+    private int pendingMapStallTicks = 0;
+    private int pendingMapRetries = 0;
+
+    /**
+     * Asks the master to re-send the map. Gives up after 5 attempts so a dead
+     * transfer cannot loop forever - the outcome is always logged.
+     */
+    private void requestRemap(String fileName, String reason) {
+        if (pendingMapRetries >= 5) {
+            error("Gave up receiving map §a" + fileName + "§7 after 5 re-requests. Last failure: " + reason);
+            HiveLog.log("MAP RECEIVE " + fileName + " GAVE UP after 5 re-requests - last failure: " + reason);
+            pendingMapName = null;
+            pendingMapChunks.clear();
+            pendingMapTotal = -1;
+            pendingMapRetries = 0;
+            return;
+        }
+        pendingMapRetries++;
+        warning("Map '" + fileName + "' transfer problem (" + reason + ") - requesting re-send (attempt "
+            + pendingMapRetries + "/5).");
+        HiveLog.log("MAP RECEIVE " + fileName + " re-request " + pendingMapRetries + "/5 - reason: " + reason);
+        SlaveSystem.queueMasterDM("remap");
+    }
+
     @Override
-    public void applyMapData(String fileName, String base64) {
+    public void applyMapData(String message) {
         if (!SlaveSystem.isSlave()) return;
         try {
-            // Skip a redundant re-send while already building the same map
-            if (mapFile != null && mapFile.getName().equals(fileName) && map != null
-                && (state == State.Walking || state == State.Dumping)) return;
+            // Format: <fileName>:<crc32>:<totalChunks>:<chunkIndex>:<base64Chunk>
+            String[] parts = message.split(":", 5);
+            if (parts.length < 5) return;
+            String fileName = parts[0];
+            long crc;
+            int total;
+            int idx;
+            try {
+                crc = Long.parseLong(parts[1]);
+                total = Integer.parseInt(parts[2]);
+                idx = Integer.parseInt(parts[3]);
+            } catch (NumberFormatException e) {
+                return;
+            }
+            String b64 = parts[4];
 
-            byte[] bytes = Base64.getDecoder().decode(base64);
+            // Skip a redundant re-send while already building the same map
+            if (idx == 0 && mapFile != null && mapFile.getName().equals(fileName) && map != null
+                && crc == loadedMapCrc && (state == State.Walking || state == State.Dumping)) return;
+
+            // New transfer (different file/checksum) resets the assembly buffer
+            if (pendingMapName == null || !pendingMapName.equals(fileName) || pendingMapCrc != crc) {
+                pendingMapName = fileName;
+                pendingMapCrc = crc;
+                pendingMapTotal = total;
+                pendingMapChunks.clear();
+                pendingMapStallTicks = 0;
+                pendingMapRetries = 0;
+            }
+            if (pendingMapChunks.put(idx, b64) == null && pendingMapChunks.size() == 1) {
+                info("Receiving map §a" + fileName + "§7 from master (" + total + " chunk(s))...");
+            }
+
+            // Wait for all chunks before assembling (TCP delivers them in order;
+            // a missing chunk means the transfer stalled - the tick watchdog re-requests)
+            if (pendingMapChunks.size() < pendingMapTotal) return;
+
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < pendingMapTotal; i++) sb.append(pendingMapChunks.get(i));
+            byte[] bytes = Base64.getDecoder().decode(sb.toString());
+            pendingMapName = null;
+            pendingMapChunks.clear();
+            pendingMapTotal = -1;
+
+            if (crc32(bytes) != crc) {
+                pendingMapName = null;
+                pendingMapChunks.clear();
+                pendingMapTotal = -1;
+                requestRemap(fileName, "CRC mismatch (received " + bytes.length + " bytes)");
+                return;
+            }
+
             File target = new File(mapFolder, fileName);
             java.nio.file.Files.write(target.toPath(), bytes);
             mapFile = target;
             startedFiles.add(target);
-            info("Receiving map §a" + fileName + "§7 from master...");
             if (!loadNBTFile()) {
-                warning("Failed to load received map file.");
+                requestRemap(fileName, "NBT parse failed");
                 return;
             }
+            loadedMapCrc = crc;
+            pendingMapRetries = 0;
+            HiveLog.log("MAP RECEIVE " + fileName + " OK (" + bytes.length + " bytes)");
             if (pendingStart && hasFullSetup()) {
                 pendingStart = false;
                 startBuilding();
@@ -1979,9 +2106,17 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 state = State.AwaitMasterMap;
             }
         } catch (Exception e) {
-            warning("Failed to process map data from master.");
+            requestRemap(pendingMapName != null ? pendingMapName : "<unknown>", "exception: " + e);
             e.printStackTrace();
         }
+    }
+
+    @Override
+    public void resendMap(String slave) {
+        if (SlaveSystem.isSlave() || finalizePhase) return;
+        if (mapFile == null) return;
+        info("Re-sending map §a" + mapFile.getName() + "§7 to " + slave + ".");
+        sendMapTo(slave);
     }
 
     @Override
@@ -1998,11 +2133,14 @@ public class CarpetPrinter extends Module implements MapPrinter {
     public void onIntervalsReassigned() {
         if (SlaveSystem.isSlave() || finalizePhase) return;
         // Re-activate parked slaves that received new rows from the re-split
+        int reactivated = 0;
         for (String slave : SlaveSystem.slaves) {
             if (Boolean.TRUE.equals(SlaveSystem.finishedSlavesDict.get(slave))) {
                 SlaveSystem.queueDM(slave, "start");
+                reactivated++;
             }
         }
+        if (reactivated > 0) HiveLog.log("REACTIVATED " + reactivated + " parked slave(s) after interval reassignment");
     }
 
     @Override
@@ -2066,26 +2204,35 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     private boolean loadConfig(File configFile) {
-        if (configFile == null || !configFile.exists() || state == null) {
-            warning("Could not find config file.");
+        if (configFile == null) {
+            error("No config file selected.");
             return false;
         }
-        List<State> allowedStates = List.of(
-            State.SelectingResetButton,
-            State.SelectingPerimeterCorner1,
-            State.SelectingPerimeterCorner2,
-            State.SelectingPerimeterCorner3,
-            State.SelectingPerimeterCorner4,
-            State.SelectingChests,
-            State.SelectingFinishedMapChest,
-            State.SelectingDumpStation,
-            State.SelectingTable,
-            State.SelectingMapArea,
-            State.AwaitRegisterResponse
-        );
-        if (!allowedStates.contains(state)) {
-            error("Can only load config during the registration phase.");
+        if (!configFile.exists()) {
+            error("Could not find config file: " + configFile.getAbsolutePath());
             return false;
+        }
+        // A null state means the module is inactive (e.g. it auto-disabled because
+        // no NBT files are in the map folder yet). Loading a config while inactive
+        // is fine - it pre-stages the setup for the next activation.
+        if (state != null) {
+            List<State> allowedStates = List.of(
+                State.SelectingResetButton,
+                State.SelectingPerimeterCorner1,
+                State.SelectingPerimeterCorner2,
+                State.SelectingPerimeterCorner3,
+                State.SelectingPerimeterCorner4,
+                State.SelectingChests,
+                State.SelectingFinishedMapChest,
+                State.SelectingDumpStation,
+                State.SelectingTable,
+                State.SelectingMapArea,
+                State.AwaitRegisterResponse
+            );
+            if (!allowedStates.contains(state)) {
+                error("Can only load config during the registration phase.");
+                return false;
+            }
         }
 
         try {
