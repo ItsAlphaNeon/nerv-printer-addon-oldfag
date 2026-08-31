@@ -712,6 +712,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (allowedStates.contains(state)) {
             toBeHandledInvPacket = packet;
             timeoutTicks = preRestockDelay.get();
+            restockStallTicks = 0; // chest data arrived - not stuck
         }
     }
 
@@ -721,35 +722,55 @@ public class CarpetPrinter extends Module implements MapPrinter {
         switch (state) {
             case AwaitRestockResponse:
                 interactTimeout = 0;
-                boolean foundMaterials = false;
-                List<Integer> slots = IntStream.rangeClosed(0, packet.contents().size() - 37)
-                    .boxed()
-                    .collect(Collectors.toList());
-                Collections.shuffle(slots);
-
-                for (int slot : slots) {
-                    ItemStack stack = packet.contents().get(slot);
-
-                    if (restockList.get(0).getMiddle() == 0) {
-                        foundMaterials = true;
-                        break;
-                    }
-                    if (!stack.isEmpty() && stack.getCount() == 64) {
-                        //info("Taking Stack of " + restockList.get(0).getLeft().getName().getString());
-                        foundMaterials = true;
-                        int highestFreeSlot = Utils.findHighestFreeSlot(packet);
-                        if (highestFreeSlot == -1) {
-                            warning("No free slots found in inventory.");
-                            checkpoints.add(0, new Pair(dumpStation.getLeft(), new Pair("dump", null)));
-                            state = State.Walking;
-                            return;
-                        }
-                        restockBacklogSlots.add(slot);
-                        Triple<Item, Integer, Integer> oldTriple = restockList.remove(0);
-                        restockList.add(0, Triple.of(oldTriple.getLeft(), oldTriple.getMiddle() - 1, oldTriple.getRight() - 64));
-                    }
+                // Interrupted-restock recovery: if the restock list is exhausted
+                // (everything already counted as taken before an interrupt), just
+                // resume - previously this fell through and deadlocked forever.
+                if (restockList.isEmpty()) {
+                    warning("Restock list is empty - resuming building.");
+                    HiveLog.log("RESTOCK recovery: restockList empty at chest - resuming");
+                    checkedChests.clear();
+                    timeoutTicks = postRestockDelay.get();
+                    state = State.Walking;
+                    break;
                 }
-                if (!foundMaterials) endRestocking();
+                boolean foundMaterials = false;
+                if (restockList.get(0).getMiddle() > 0) {
+                    List<Integer> slots = IntStream.rangeClosed(0, packet.contents().size() - 37)
+                        .boxed()
+                        .collect(Collectors.toList());
+                    Collections.shuffle(slots);
+
+                    for (int slot : slots) {
+                        ItemStack stack = packet.contents().get(slot);
+
+                        if (restockList.get(0).getMiddle() == 0) {
+                            foundMaterials = true;
+                            break;
+                        }
+                        if (!stack.isEmpty() && stack.getCount() == 64) {
+                            //info("Taking Stack of " + restockList.get(0).getLeft().getName().getString());
+                            foundMaterials = true;
+                            int highestFreeSlot = Utils.findHighestFreeSlot(packet);
+                            if (highestFreeSlot == -1) {
+                                warning("No free slots found in inventory.");
+                                checkpoints.add(0, new Pair(dumpStation.getLeft(), new Pair("dump", null)));
+                                state = State.Walking;
+                                return;
+                            }
+                            restockBacklogSlots.add(slot);
+                            Triple<Item, Integer, Integer> oldTriple = restockList.remove(0);
+                            restockList.add(0, Triple.of(oldTriple.getLeft(), oldTriple.getMiddle() - 1, oldTriple.getRight() - 64));
+                        }
+                    }
+                } else {
+                    // Nothing more needed from this chest (stale backlog was cleared
+                    // after an interrupt) - finish the chest instead of deadlocking.
+                    foundMaterials = true;
+                    restockBacklogSlots.clear();
+                }
+                // End the chest visit when the backlog is empty: either nothing was
+                // found here (find another chest) or everything needed was taken.
+                if (restockBacklogSlots.isEmpty()) endRestocking();
                 break;
             case AwaitMapChestResponse:
                 int mapSlot = -1;
@@ -846,6 +867,51 @@ public class CarpetPrinter extends Module implements MapPrinter {
             }
         } else {
             pendingMapStallTicks = 0;
+        }
+
+        // Restock stuck watchdog: if we are waiting for chest data and nothing
+        // arrives for ~10s (interrupted interaction, server glitch), close the
+        // screen, re-plan the restock run from the current inventory and resume.
+        if (state == State.AwaitRestockResponse && toBeHandledInvPacket == null) {
+            if (++restockStallTicks >= 200) {
+                restockStallTicks = 0;
+                warning("Restock stuck at the chest - re-planning the restock run...");
+                HiveLog.log("RESTOCK stalled at chest "
+                    + (lastInteractedBlockPos != null ? lastInteractedBlockPos.toShortString() : "?")
+                    + " - re-planning");
+                if (mc.currentScreen != null) mc.player.closeHandledScreen();
+                restockBacklogSlots.clear();
+                closeNextInvPacket = false;
+                Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInfo =
+                    Utils.getInvInformation(getRequiredItems(), availableSlots);
+                refillInventory(invInfo.getRight());
+                // refillInventory queued a new refill checkpoint if anything is missing
+                state = State.Walking;
+                return;
+            }
+        } else {
+            restockStallTicks = 0;
+        }
+
+        // Work-balance sweep (master, while building): refresh own progress,
+        // log a PROGRESS line every 30s, and let an idle master steal work.
+        if (!SlaveSystem.isSlave() && !finalizePhase && map != null
+            && (state == State.Walking || state == State.Dumping || state == State.AwaitMasterAllBuilt)) {
+            if (++progressSweepTicks >= 600) {
+                progressSweepTicks = 0;
+                ownUnfinished = countUnfinishedRowsInInterval(workingInterval);
+                StringBuilder progress = new StringBuilder("PROGRESS master: ").append(ownUnfinished).append(" rows left");
+                for (String slave : SlaveSystem.slaves) {
+                    progress.append(", ").append(slave).append(": ").append(slaveRemaining(slave)).append(" (est)");
+                }
+                HiveLog.log(progress.toString());
+                if (ownUnfinished == 0) {
+                    // Master is done but slaves still have substantial work - take over the tail
+                    stealWork("master");
+                }
+            }
+        } else {
+            progressSweepTicks = 0;
         }
 
         if (!state.equals(debugPreviousState)) {
@@ -1063,6 +1129,13 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 case "lineEnd":
                     boolean reachedNorthSide = goal.z == mapCorner.toCenterPos().z;
                     calculateBuildingPath(reachedNorthSide, false);
+                    // Report remaining work for hivemind work balancing
+                    int unfinishedRows = countUnfinishedRowsInInterval(workingInterval);
+                    if (SlaveSystem.isSlave()) {
+                        SlaveSystem.queueMasterDM("progress:" + unfinishedRows);
+                    } else {
+                        ownUnfinished = unfinishedRows;
+                    }
                     ArrayList<BlockPos> newErrors = Utils.getInvalidPlacements(mapCorner, workingInterval, map, knownErrors);
                     for (BlockPos errorPos : newErrors) {
                         BlockPos relativePos = errorPos.subtract(mapCorner);
@@ -1314,6 +1387,13 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     private void endRestocking() {
+        // Safety: an interrupted restock can leave the list empty - just resume
+        if (restockList.isEmpty()) {
+            checkedChests.clear();
+            timeoutTicks = postRestockDelay.get();
+            state = State.Walking;
+            return;
+        }
         if (restockList.get(0).getMiddle() > 0) {
             warning("Not all necessary stacks restocked. Searching for another chest...");
             //Search for the next best chest
@@ -1465,6 +1545,134 @@ public class CarpetPrinter extends Module implements MapPrinter {
         checkpoints.add(0, new Pair(mc.player.getEntityPos(), new Pair("sprint", null)));
         checkpoints.add(0, new Pair(dumpStation.getLeft(), new Pair("dump", null)));
         return false;
+    }
+
+    // Work balancing state (master side)
+    private final HashMap<String, Integer> slaveUnfinished = new HashMap<>();
+    private int ownUnfinished = -1;
+    private int progressSweepTicks = 0;
+    /** Ticks spent in AwaitRestockResponse without any chest data arriving. */
+    private int restockStallTicks = 0;
+    /** Never steal from a bot with fewer unfinished rows than this (avoids endgame thrashing). */
+    private static final int MIN_STEAL_ROWS = 8;
+    /** Always steal at least this many rows so the taker's trip is worth it. */
+    private static final int MIN_STEAL_AMOUNT = 4;
+
+    /** Block count per map row, for workload-weighted interval splitting. */
+    @Override
+    public int[] getRowBlocks() {
+        if (map == null) return null;
+        int[] counts = new int[128];
+        for (int x = 0; x < 128; x++) {
+            int c = 0;
+            for (int z = 0; z < 128; z++) if (map[x][z] != null) c++;
+            counts[x] = c;
+        }
+        return counts;
+    }
+
+    @Override
+    public void onSlaveProgress(String slave, int unfinishedRows) {
+        if (SlaveSystem.isSlave()) return;
+        slaveUnfinished.put(slave, unfinishedRows);
+    }
+
+    /** Number of rows in the interval that still have at least one block to place. */
+    private int countUnfinishedRowsInInterval(Pair<Integer, Integer> interval) {
+        if (map == null || mapCorner == null || interval == null) return 0;
+        int count = 0;
+        for (int x = interval.getLeft(); x <= interval.getRight(); x++) {
+            for (int z = 0; z < 128; z++) {
+                if (map[x][z] == null) continue;
+                if (MapAreaCache.getCachedBlockState(mapCorner.add(x, 0, z)).isAir()) {
+                    count++;
+                    break;
+                }
+            }
+        }
+        return count;
+    }
+
+    private static int intervalRows(Pair<Integer, Integer> interval) {
+        return interval == null ? 0 : interval.getRight() - interval.getLeft() + 1;
+    }
+
+    private int slaveRemaining(String slave) {
+        Pair<Integer, Integer> interval = SlaveSystem.slaveIntervals.get(slave);
+        if (interval == null) return 0;
+        return slaveUnfinished.getOrDefault(slave, intervalRows(interval));
+    }
+
+    /**
+     * Steals the tail of the busiest bot's remaining work and hands it to an idle
+     * bot (a slave that just finished, or the master itself). Contiguous ranges
+     * keep walking paths sane; placed lines are skipped on recalculation.
+     *
+     * @return true when work was re-assigned (idle bot must NOT be parked)
+     */
+    private boolean stealWork(String idleSlave) {
+        if (finalizePhase || !hasFullSetup()) return false;
+
+        // Find the giver with the most remaining work (master or any other slave)
+        Pair<Integer, Integer> giverInterval = null;
+        String giverName = null;
+        int giverRemaining = 0;
+        int masterRemaining = countUnfinishedRowsInInterval(workingInterval);
+        if (masterRemaining >= MIN_STEAL_ROWS) {
+            giverInterval = workingInterval;
+            giverName = "master";
+            giverRemaining = masterRemaining;
+        }
+        for (String slave : SlaveSystem.slaves) {
+            if (slave.equals(idleSlave)) continue;
+            int rem = slaveRemaining(slave);
+            if (rem > giverRemaining) {
+                Pair<Integer, Integer> interval = SlaveSystem.slaveIntervals.get(slave);
+                if (interval == null) continue;
+                giverInterval = interval;
+                giverName = slave;
+                giverRemaining = rem;
+            }
+        }
+        if (giverInterval == null || giverRemaining < MIN_STEAL_ROWS) return false;
+
+        int steal = Math.max(MIN_STEAL_AMOUNT, giverRemaining / 2);
+        int giverSize = intervalRows(giverInterval);
+        steal = Math.min(steal, giverSize - 1);
+        if (steal < MIN_STEAL_AMOUNT) return false;
+
+        Pair<Integer, Integer> stolen = new Pair<>(giverInterval.getRight() - steal + 1, giverInterval.getRight());
+        Pair<Integer, Integer> kept = new Pair<>(giverInterval.getLeft(), giverInterval.getRight() - steal);
+
+        if (giverName.equals("master")) {
+            // Master keeps its own (still unfinished) head rows and keeps building
+            setInterval(kept);
+            calculateBuildingPath(startNorthToSouth.get(), true);
+        } else {
+            SlaveSystem.slaveIntervals.put(giverName, kept);
+            slaveUnfinished.remove(giverName); // stale after the interval change
+            SlaveSystem.queueDM(giverName, "interval:" + kept.getLeft() + ":" + kept.getRight());
+        }
+
+        if (idleSlave.equals("master")) {
+            // Master finished its own rows and takes over the stolen tail
+            setInterval(stolen);
+            calculateBuildingPath(startNorthToSouth.get(), true);
+            if (state == State.AwaitMasterAllBuilt) state = State.Walking;
+        } else {
+            SlaveSystem.slaveIntervals.put(idleSlave, stolen);
+            SlaveSystem.queueDM(idleSlave, "interval:" + stolen.getLeft() + ":" + stolen.getRight());
+            SlaveSystem.queueDM(idleSlave, "start");
+            SlaveSystem.finishedSlavesDict.put(idleSlave, false);
+            SlaveSystem.activeSlavesDict.put(idleSlave, true);
+        }
+
+        HiveLog.log("STEAL rows " + stolen.getLeft() + "-" + stolen.getRight() + " of " + giverName
+            + " -> " + idleSlave + " (giver keeps rows " + kept.getLeft() + "-" + kept.getRight()
+            + ", est " + giverRemaining + " unfinished)");
+        info("Reassigned rows " + stolen.getLeft() + "-" + stolen.getRight() + " from " + giverName
+            + " to " + idleSlave + " (work balancing).");
+        return true;
     }
 
     // Path and Building Management
@@ -1882,6 +2090,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     public void slaveFinished(String slave) {
+        slaveUnfinished.put(slave, 0);
+        // Work balancing: before parking this slave, give it the tail of the
+        // busiest bot's remaining rows (only during the build phase).
+        if (!finalizePhase && stealWork(slave)) return;
         // Master assigns the finished slave one of the perimeter corners to park at
         if (perimeterCorners.isEmpty()) return;
         int corner = cornerCounter % perimeterCorners.size();
@@ -1946,8 +2158,18 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     private void sendMapTo(String slave) {
+        byte[] bytes;
         try {
-            byte[] bytes = java.nio.file.Files.readAllBytes(mapFile.toPath());
+            bytes = java.nio.file.Files.readAllBytes(mapFile.toPath());
+        } catch (Exception e) {
+            warning("Failed to read map file for transmission: " + mapFile.getName()
+                + " - " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            HiveLog.log("MAP SEND " + mapFile.getName() + " to " + slave + " FAILED reading file: "
+                + e.getClass().getName() + ": " + e.getMessage());
+            e.printStackTrace();
+            return;
+        }
+        try {
             long crc = crc32(bytes);
             String b64 = Base64.getEncoder().encodeToString(bytes);
             // Chunked transfer: one giant frame proved unreliable on some slave
@@ -2089,7 +2311,20 @@ public class CarpetPrinter extends Module implements MapPrinter {
             }
 
             File target = new File(mapFolder, fileName);
-            java.nio.file.Files.write(target.toPath(), bytes);
+            try {
+                java.nio.file.Files.write(target.toPath(), bytes);
+                long written = java.nio.file.Files.size(target.toPath());
+                if (written != bytes.length) {
+                    requestRemap(fileName, "file write truncated (wrote " + written + "/" + bytes.length + " bytes)");
+                    return;
+                }
+                HiveLog.log("MAP RECEIVE " + fileName + " wrote " + written + " bytes to disk");
+            } catch (Exception e) {
+                requestRemap(fileName, "file write failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                HiveLog.log("MAP RECEIVE " + fileName + " WRITE FAILED: " + e.getClass().getName() + ": " + e.getMessage());
+                e.printStackTrace();
+                return;
+            }
             mapFile = target;
             startedFiles.add(target);
             if (!loadNBTFile()) {
@@ -2132,6 +2367,9 @@ public class CarpetPrinter extends Module implements MapPrinter {
     @Override
     public void onIntervalsReassigned() {
         if (SlaveSystem.isSlave() || finalizePhase) return;
+        // Progress estimates are stale after any interval change
+        slaveUnfinished.clear();
+        ownUnfinished = -1;
         // Re-activate parked slaves that received new rows from the re-split
         int reactivated = 0;
         for (String slave : SlaveSystem.slaves) {
@@ -2149,14 +2387,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     private boolean hasUnfinishedRowsInInterval() {
-        if (map == null || mapCorner == null || workingInterval == null) return false;
-        for (int x = workingInterval.getLeft(); x <= workingInterval.getRight(); x++) {
-            for (int z = 0; z < 128; z++) {
-                if (map[x][z] == null) continue;
-                if (MapAreaCache.getCachedBlockState(mapCorner.add(x, 0, z)).isAir()) return true;
-            }
-        }
-        return false;
+        return countUnfinishedRowsInInterval(workingInterval) > 0;
     }
 
     // Path Change Check
@@ -2295,34 +2526,92 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     private boolean loadNBTFile() {
+        info("Building: §a" + mapFile.getName());
+        long fileSize = -1;
         try {
-            info("Building: §a" + mapFile.getName());
-            NbtSizeTracker sizeTracker = new NbtSizeTracker(0x20000000L, 100);
-            NbtCompound nbt = NbtIo.readCompressed(mapFile.toPath(), sizeTracker);
-            //Extracting the palette
-            NbtList paletteList = (NbtList) nbt.get("palette");
-            blockPaletteDict = Utils.getBlockPalette(paletteList);
+            fileSize = java.nio.file.Files.size(mapFile.toPath());
+        } catch (Exception e) {
+            HiveLog.log("NBT LOAD " + mapFile.getName() + " could not stat file: " + e);
+            warning("Could not stat map file " + mapFile.getName() + ": " + e);
+        }
 
-            //Remove any blocks that should be ignored
+        // Stage 1: gzip decompress + NBT parse
+        NbtCompound nbt;
+        try {
+            NbtSizeTracker sizeTracker = new NbtSizeTracker(0x20000000L, 100);
+            nbt = NbtIo.readCompressed(mapFile.toPath(), sizeTracker);
+        } catch (Exception e) {
+            warning("NBT parse failed for " + mapFile.getName() + " (" + fileSize + " bytes): "
+                + e.getClass().getSimpleName() + ": " + e.getMessage());
+            HiveLog.log("NBT LOAD " + mapFile.getName() + " STAGE parse FAILED (file " + fileSize
+                + " bytes): " + e.getClass().getName() + ": " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+        HiveLog.log("NBT LOAD " + mapFile.getName() + " parse OK (file " + fileSize + " bytes)");
+
+        // Stage 2: palette extraction
+        try {
+            NbtList paletteList = (NbtList) nbt.get("palette");
+            if (paletteList == null) {
+                warning("Map " + mapFile.getName() + " has no 'palette' tag.");
+                HiveLog.log("NBT LOAD " + mapFile.getName() + " STAGE palette FAILED: missing 'palette' tag. Root keys: " + nbt.getKeys());
+                return false;
+            }
+            blockPaletteDict = Utils.getBlockPalette(paletteList);
+        } catch (Exception e) {
+            warning("Palette extraction failed for " + mapFile.getName() + ": "
+                + e.getClass().getSimpleName() + ": " + e.getMessage());
+            HiveLog.log("NBT LOAD " + mapFile.getName() + " STAGE palette FAILED: " + e.getClass().getName() + ": " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+
+        // Stage 3: drop ignored blocks
+        try {
             List<Integer> toBeRemoved = new ArrayList<>();
             for (int key : blockPaletteDict.keySet()) {
                 if (ignoredBlocks.get().contains(blockPaletteDict.get(key).getLeft())) toBeRemoved.add(key);
             }
             for (int key : toBeRemoved) blockPaletteDict.remove(key);
-
-            NbtList blockList = (NbtList) nbt.get("blocks");
-            map = Utils.generateMapArray(blockList, blockPaletteDict);
-
-            info("Requirements: ");
-            for (Pair<Block, Integer> p : blockPaletteDict.values()) {
-                info(p.getLeft().getName().getString() + ": " + p.getRight());
-            }
-
-            return true;
         } catch (Exception e) {
+            warning("Ignoring blocks failed for " + mapFile.getName() + ": "
+                + e.getClass().getSimpleName() + ": " + e.getMessage());
+            HiveLog.log("NBT LOAD " + mapFile.getName() + " STAGE ignore-filter FAILED: " + e.getClass().getName() + ": " + e.getMessage());
             e.printStackTrace();
             return false;
         }
+
+        // Stage 4: build the 128x128 map array
+        try {
+            NbtList blockList = (NbtList) nbt.get("blocks");
+            if (blockList == null) {
+                warning("Map " + mapFile.getName() + " has no 'blocks' tag.");
+                HiveLog.log("NBT LOAD " + mapFile.getName() + " STAGE map-array FAILED: missing 'blocks' tag. Root keys: " + nbt.getKeys());
+                return false;
+            }
+            map = Utils.generateMapArray(blockList, blockPaletteDict);
+            if (map == null) {
+                warning("Map array generation returned null for " + mapFile.getName() + ".");
+                HiveLog.log("NBT LOAD " + mapFile.getName() + " STAGE map-array FAILED: generateMapArray returned null (blocks: " + blockList.size() + ")");
+                return false;
+            }
+            HiveLog.log("NBT LOAD " + mapFile.getName() + " map array built: " + blockList.size() + " block entries, palette " + blockPaletteDict.size());
+        } catch (Exception e) {
+            warning("Map array generation failed for " + mapFile.getName() + ": "
+                + e.getClass().getSimpleName() + ": " + e.getMessage());
+            HiveLog.log("NBT LOAD " + mapFile.getName() + " STAGE map-array FAILED: " + e.getClass().getName() + ": " + e.getMessage());
+            e.printStackTrace();
+            map = null;
+            return false;
+        }
+
+        info("Requirements: ");
+        for (Pair<Block, Integer> p : blockPaletteDict.values()) {
+            info(p.getLeft().getName().getString() + ": " + p.getRight());
+        }
+
+        return true;
     }
 
     // Rendering

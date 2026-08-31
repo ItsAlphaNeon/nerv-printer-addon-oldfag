@@ -1824,6 +1824,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     public void resendMap(String slave) {
     }
 
+    public int[] getRowBlocks() {
+        return null;
+    }
+
+    public void onSlaveProgress(String slave, int unfinishedRows) {
+    }
+
     public void goToCorner(int cornerIndex) {
     }
 

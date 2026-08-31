@@ -32,6 +32,8 @@ public final class SlaveSystem {
     public static ArrayList<String> slaves = new ArrayList<>();
     public static HashMap<String, Boolean> activeSlavesDict = new HashMap<>();
     public static HashMap<String, Boolean> finishedSlavesDict = new HashMap<>();
+    /** Row interval currently assigned to each slave (for work stealing). */
+    public static final HashMap<String, Pair<Integer, Integer>> slaveIntervals = new HashMap<>();
     public static SlaveTableController tableController = null;
 
     private static MapPrinter printerModule = null;
@@ -224,6 +226,7 @@ public final class SlaveSystem {
                 slaves.removeIf(n -> n.equals(name));
                 activeSlavesDict.remove(name);
                 finishedSlavesDict.remove(name);
+                slaveIntervals.remove(name);
                 toBeConfirmedSlaves.remove(name);
                 HiveLog.log("DISCONNECT " + name + " (registered slaves left: " + slaves.size() + ")");
                 ChatUtils.info("Slave disconnected: " + name);
@@ -413,13 +416,14 @@ public final class SlaveSystem {
     }
 
     public static void generateIntervals() {
-        int sectionSize = (int) Math.ceil((float) 128 / (float) (slaves.size() + 1));
-        ArrayList<Pair<Integer, Integer>> intervals = new ArrayList<>();
-        for (int end = 127; end >= 0; end -= sectionSize) {
-            int start = Math.max(0, end - sectionSize + 1);
-            intervals.add(new Pair<>(start, end));
-        }
-        Collections.reverse(intervals);
+        int botCount = slaves.size() + 1;
+        // Work-weighted split: when the master has the map parsed, split rows 0-127
+        // into contiguous sections with ~equal BLOCK counts (row counts alone are
+        // wildly uneven on real maparts). Falls back to an equal-row split when no
+        // map is loaded.
+        int[] rowBlocks = printerModule.getRowBlocks();
+        ArrayList<Pair<Integer, Integer>> intervals =
+            (rowBlocks != null && rowBlocks.length == 128) ? weightedIntervals(rowBlocks, botCount) : equalIntervals(botCount);
 
         Pair<Integer, Integer> printerModuleInterval = intervals.remove((intervals.size() - 1) / 2);
         printerModule.setInterval(printerModuleInterval);
@@ -429,18 +433,65 @@ public final class SlaveSystem {
         Collections.sort(sortedSlaves, String.CASE_INSENSITIVE_ORDER);
 
         StringBuilder assignment = new StringBuilder("INTERVALS reassigned -> master: rows "
-            + printerModuleInterval.getLeft() + "-" + printerModuleInterval.getRight());
+            + printerModuleInterval.getLeft() + "-" + printerModuleInterval.getRight()
+            + (rowBlocks != null ? " (" + sumBlocks(rowBlocks, printerModuleInterval) + " blocks)" : ""));
         for (int i = 0; i < intervals.size(); i++) {
             String slave = sortedSlaves.get(i);
+            Pair<Integer, Integer> interval = intervals.get(i);
+            slaveIntervals.put(slave, interval);
             assignment.append(", ").append(slave).append(": rows ")
-                .append(intervals.get(i).getLeft()).append("-").append(intervals.get(i).getRight());
-            SlaveSystem.queueDM(slave, "interval:" + intervals.get(i).getLeft() + ":" + intervals.get(i).getRight());
+                .append(interval.getLeft()).append("-").append(interval.getRight())
+                .append(rowBlocks != null ? " (" + sumBlocks(rowBlocks, interval) + " blocks)" : "");
+            SlaveSystem.queueDM(slave, "interval:" + interval.getLeft() + ":" + interval.getRight());
         }
+        slaveIntervals.keySet().removeIf(s -> !slaves.contains(s));
         HiveLog.log(assignment.toString());
 
         // Hivemind: parked (already finished) slaves may have received new rows -
         // re-activate them so the re-split rows actually get built.
         printerModule.onIntervalsReassigned();
+    }
+
+    /** Splits rows 0-127 into n contiguous sections with ~equal block counts. */
+    private static ArrayList<Pair<Integer, Integer>> weightedIntervals(int[] rowBlocks, int n) {
+        long total = 0;
+        for (int b : rowBlocks) total += b;
+        ArrayList<Pair<Integer, Integer>> out = new ArrayList<>();
+        int start = 0;
+        int section = 0;
+        long cum = 0;
+        for (int x = 0; x < 128; x++) {
+            cum += rowBlocks[x];
+            boolean last = x == 127;
+            long target = Math.round((double) total * (section + 1) / n);
+            // Cut a section when we reach its cumulative block target, but always
+            // leave at least one row for every remaining section.
+            if (!last && section < n - 1 && cum >= target && (127 - x) >= (n - 1 - section)) {
+                out.add(new Pair<>(start, x));
+                start = x + 1;
+                section++;
+            }
+            if (last) out.add(new Pair<>(start, x));
+        }
+        return out;
+    }
+
+    /** Legacy equal-row split (fallback when no map is loaded). */
+    private static ArrayList<Pair<Integer, Integer>> equalIntervals(int botCount) {
+        int sectionSize = (int) Math.ceil((float) 128 / (float) botCount);
+        ArrayList<Pair<Integer, Integer>> intervals = new ArrayList<>();
+        for (int end = 127; end >= 0; end -= sectionSize) {
+            int start = Math.max(0, end - sectionSize + 1);
+            intervals.add(new Pair<>(start, end));
+        }
+        Collections.reverse(intervals);
+        return intervals;
+    }
+
+    private static long sumBlocks(int[] rowBlocks, Pair<Integer, Integer> interval) {
+        long sum = 0;
+        for (int x = interval.getLeft(); x <= interval.getRight(); x++) sum += rowBlocks[x];
+        return sum;
     }
 
     // ------------------------------------------------------------------
@@ -590,6 +641,7 @@ public final class SlaveSystem {
         slaves.remove(slave);
         activeSlavesDict.remove(slave);
         finishedSlavesDict.remove(slave);
+        slaveIntervals.remove(slave);
         toBeConfirmedSlaves.remove(slave);
         queueDM(slave, "remove");
         generateIntervals();
@@ -648,10 +700,6 @@ public final class SlaveSystem {
                 case "skip":
                     printerModule.skipBuilding();
                     break;
-                case "remap":
-                    // Slave's map transfer was incomplete/corrupt - re-send it
-                    printerModule.resendMap(sender);
-                    break;
                 case "mine":
                     if (colonSplit.length < 2) break;
                     printerModule.mineLine(Integer.valueOf(colonSplit[1]));
@@ -691,6 +739,19 @@ public final class SlaveSystem {
                     BlockPos relativeErrorPos = new BlockPos(Integer.valueOf(colonSplit[1]), 0, Integer.valueOf(colonSplit[2]));
                     HiveLog.log("ERROR " + sender + " reported failed block at rel " + relativeErrorPos.getX() + "," + relativeErrorPos.getZ());
                     printerModule.addError(relativeErrorPos);
+                    break;
+                case "remap":
+                    // Slave's map transfer was incomplete/corrupt - re-send it
+                    HiveLog.log("REMAP requested by " + sender);
+                    printerModule.resendMap(sender);
+                    break;
+                case "progress":
+                    // Slave reports unfinished-row count for work balancing
+                    if (colonSplit.length < 2) break;
+                    try {
+                        printerModule.onSlaveProgress(sender, Integer.valueOf(colonSplit[1]));
+                    } catch (NumberFormatException ignored) {
+                    }
                     break;
             }
         }

@@ -37,6 +37,17 @@ public interface MapPrinter {
 
     void resendMap(String slave);
 
+    // Efficiency: workload balancing
+
+    /**
+     * Master-side: block count for every map row (index 0-127), or null when no
+     * map is loaded. Used to split rows by workload instead of by row count.
+     */
+    int[] getRowBlocks();
+
+    /** Master-side: a slave reported how many unfinished rows its interval still has. */
+    void onSlaveProgress(String slave, int unfinishedRows);
+
     void goToCorner(int cornerIndex);
 
     void onIntervalsReassigned();
