@@ -33,6 +33,10 @@ dependencies {
 
     // Meteor
     modImplementation "meteordevelopment:meteor-client:${project.meteor_version}"
+
+    // WebSocket transport for multi-user printing (bundled into the jar)
+    include implementation("org.java-websocket:Java-WebSocket:1.5.7")
+    include implementation("org.slf4j:slf4j-api:2.0.13")
 }
 
 processResources {

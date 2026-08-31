@@ -1,57 +1,182 @@
 package com.julflips.nerv_printer.utils;
 
 import com.julflips.nerv_printer.interfaces.MapPrinter;
-import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.entity.Entity;
-import net.minecraft.entity.player.PlayerEntity;
-import net.minecraft.network.packet.s2c.play.ChatMessageS2CPacket;
-import net.minecraft.network.packet.s2c.play.GameMessageS2CPacket;
 import net.minecraft.util.Pair;
 import net.minecraft.util.math.BlockPos;
+import org.java_websocket.WebSocket;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.UUID;
+import java.util.Map;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
 public final class SlaveSystem {
 
-    public static int commandDelay = 0;
-    public static String directMessageCommand = "w";
-    public static String senderPrefix = "";
-    public static String senderSuffix = "";
-    public static int randomLength = 0;
+    public static int masterPort = 8080;
+    public static String masterAddress = "";
     public static ArrayList<String> slaves = new ArrayList<>();
     public static HashMap<String, Boolean> activeSlavesDict = new HashMap<>();
     public static HashMap<String, Boolean> finishedSlavesDict = new HashMap<>();
     public static SlaveTableController tableController = null;
 
     private static MapPrinter printerModule = null;
-    private static int timeout = 0;
-    private static ArrayList<String> toBeSentMessages = new ArrayList<>();
     private static ArrayList<String> toBeConfirmedSlaves = new ArrayList<>();
     private static String master = null;
 
-    public static void setupSlaveSystem(MapPrinter module, int delay, String dmCommand, String prefix, String suffix, int randomSuffixLength) {
+    // WebSocket transport
+    private static MasterSocketServer server = null;
+    private static volatile boolean serverStarted = false;
+    private static SlaveSocketClient client = null;
+    // Master side: connection -> slave player name (learned from the first message)
+    private static final HashMap<WebSocket, String> slaveConnections = new HashMap<>();
+    private static int reconnectTimer = 0;
+
+    public static void setupSlaveSystem(MapPrinter module, int port, String address) {
         printerModule = module;
-        commandDelay = delay;
-        directMessageCommand = dmCommand;
-        senderPrefix = prefix;
-        senderSuffix = suffix;
-        randomLength = randomSuffixLength;
+        masterPort = port;
+        masterAddress = address;
         slaves.clear();
-        toBeSentMessages.clear();
         toBeConfirmedSlaves.clear();
         activeSlavesDict.clear();
         finishedSlavesDict.clear();
         master = null;
+
+        // Role selection: an empty master-address means we host as the master,
+        // otherwise we connect to the configured master as a slave.
+        if (isMasterMode()) {
+            ensureServer();
+        } else {
+            ensureClient();
+        }
     }
+
+    public static boolean isMasterMode() {
+        return masterAddress.trim().isEmpty();
+    }
+
+    // ------------------------------------------------------------------
+    // WebSocket transport
+    // ------------------------------------------------------------------
+
+    private static void ensureServer() {
+        if (serverStarted) return;
+        stopServer();
+        try {
+            server = new MasterSocketServer(masterPort);
+            server.start(); // runs on its own thread
+        } catch (Exception e) {
+            ChatUtils.error("Failed to start multi-user socket server on port " + masterPort + ": " + e.getMessage());
+        }
+    }
+
+    private static void stopServer() {
+        serverStarted = false;
+        if (server != null) {
+            try {
+                server.stop(0);
+            } catch (Exception ignored) {
+            }
+            server = null;
+        }
+        slaveConnections.clear();
+    }
+
+    private static void ensureClient() {
+        stopServer(); // never host while acting as a slave
+        if (client != null && client.isOpen()) return;
+        if (client == null || client.isClosed()) {
+            try {
+                client = new SlaveSocketClient(new java.net.URI("ws://" + masterAddress.trim() + ":" + masterPort));
+            } catch (java.net.URISyntaxException e) {
+                ChatUtils.error("Invalid master address: " + masterAddress);
+                return;
+            }
+        }
+        // connect() blocks, so run it on its own thread
+        new Thread(() -> {
+            try {
+                client.connect();
+            } catch (Exception ignored) {
+            }
+        }).start();
+        reconnectTimer = 100;
+    }
+
+    public static void restartServer(int port) {
+        masterPort = port;
+        if (isMasterMode() && printerModule != null) ensureServer();
+    }
+
+    /** Called from the WebSocket server thread once the server socket is bound. */
+    public static void onServerStarted() {
+        serverStarted = true;
+    }
+
+    /** Called from the WebSocket server thread when a slave connection drops. */
+    public static void onConnectionClosed(WebSocket conn) {
+        mc.execute(() -> {
+            String name = slaveConnections.remove(conn);
+            if (name != null && slaves.contains(name)) {
+                slaves.remove(name);
+                activeSlavesDict.remove(name);
+                finishedSlavesDict.remove(name);
+                toBeConfirmedSlaves.remove(name);
+                ChatUtils.info("Slave disconnected: " + name);
+                generateIntervals();
+                if (tableController != null) tableController.rebuild();
+            } else if (name != null) {
+                toBeConfirmedSlaves.remove(name);
+            }
+        });
+    }
+
+    /** Called from the WebSocket client thread when the master connection drops. */
+    public static void onClientDisconnected() {
+        mc.execute(() -> {
+            if (master != null) {
+                master = null;
+                ChatUtils.warning("Lost connection to master.");
+                if (tableController != null) tableController.rebuild();
+            }
+        });
+    }
+
+    /**
+     * Entry point for every incoming WebSocket message.
+     * Wire format: ("s" | "m") + ":" + senderName + ":" + command[:args...]
+     * "s" messages come from slaves (conn != null, master side),
+     * "m" messages come from the master (conn == null, slave side).
+     */
+    public static void onSocketMessage(@Nullable WebSocket conn, String raw) {
+        String[] split = raw.split(":", 3);
+        if (split.length < 3) return;
+        String sender = split[1];
+        String content = split[2];
+        mc.execute(() -> {
+            if (printerModule == null) return;
+            if (conn != null && !slaveConnections.containsKey(conn)) {
+                slaveConnections.put(conn, sender);
+                toBeConfirmedSlaves.add(sender);
+                ChatUtils.info("New connection: " + sender);
+                if (tableController != null) tableController.rebuild();
+            }
+            handleMessage(content, sender);
+        });
+    }
+
+    private static void sendToSocket(WebSocket conn, String message) {
+        conn.send("m:" + mc.player.getName().getString() + ":" + message);
+    }
+
+    // ------------------------------------------------------------------
+    // Sending (direct, no chat queue / rate limiting needed anymore)
+    // ------------------------------------------------------------------
 
     public static void queueMasterDM(String message) {
         if (master != null) {
@@ -60,7 +185,19 @@ public final class SlaveSystem {
     }
 
     public static void queueDM(String recipient, String message) {
-        toBeSentMessages.add(directMessageCommand + " " + recipient + " " + message);
+        if (printerModule == null) return;
+        if (recipient.equals(master)) {
+            if (client != null && client.isOpen()) {
+                client.send("s:" + mc.player.getName().getString() + ":" + message);
+            }
+            return;
+        }
+        for (Map.Entry<WebSocket, String> entry : slaveConnections.entrySet()) {
+            if (entry.getValue().equals(recipient)) {
+                sendToSocket(entry.getKey(), message);
+                return;
+            }
+        }
     }
 
     public static boolean allSlavesFinished() {
@@ -122,13 +259,6 @@ public final class SlaveSystem {
 
         printerModule.setInterval(intervals.remove((intervals.size() - 1) / 2));
 
-        // Remove all previously queued interval messages
-        ArrayList<String> toBeRemoved = new ArrayList<>();
-        for (String message : toBeSentMessages) {
-            if (message.contains("interval")) toBeRemoved.add(message);
-        }
-        toBeRemoved.forEach((message) -> toBeSentMessages.remove(message));
-
         // Sort slaves deterministically
         ArrayList<String> sortedSlaves = new ArrayList<>(slaves);
         Collections.sort(sortedSlaves, String.CASE_INSENSITIVE_ORDER);
@@ -144,19 +274,12 @@ public final class SlaveSystem {
             ChatUtils.warning("The module needs to be enabled to register new slaves.");
             return;
         }
-        ArrayList<String> foundPlayers = new ArrayList<>();
-        for (Entity entity : mc.world.getEntities()) {
-            if (entity instanceof PlayerEntity player && !mc.player.equals(player)) {
-                foundPlayers.add(player.getName().getString());
-            }
+        if (slaveConnections.isEmpty()) {
+            ChatUtils.warning("No slaves connected to the socket server.");
         }
-        if (foundPlayers.isEmpty()) {
-            ChatUtils.warning("No players found in render distance.");
-        }
-        toBeConfirmedSlaves = foundPlayers;
-        for (String slave : foundPlayers) {
-            if (slaves.contains(slave)) continue;
-            SlaveSystem.queueDM(slave, "register");
+        for (Map.Entry<WebSocket, String> entry : slaveConnections.entrySet()) {
+            if (slaves.contains(entry.getValue())) continue;
+            sendToSocket(entry.getKey(), "register");
         }
     }
 
@@ -164,39 +287,24 @@ public final class SlaveSystem {
         slaves.remove(slave);
         activeSlavesDict.remove(slave);
         finishedSlavesDict.remove(slave);
+        toBeConfirmedSlaves.remove(slave);
         queueDM(slave, "remove");
         generateIntervals();
     }
 
-    public static boolean canSeePlayer(String playerName) {
-        for (Entity entity : mc.world.getEntities()) {
-            if (entity instanceof PlayerEntity player && player.getName().getString().equals(playerName)) {
-                return true;
-            }
-        }
-        return false;
-    }
+    // ------------------------------------------------------------------
+    // Message handling (command logic unchanged from the DM system)
+    // ------------------------------------------------------------------
 
-    private static void handleMessage(String rawMessage, @Nullable String sender) {
-        String content;
-        // Extract sender from message if not provided in packet
-        if (sender != null) {
-            content = rawMessage;
-        } else {
-            int prefixIndex = rawMessage.indexOf(senderPrefix);
-            int suffixIndex = rawMessage.indexOf(senderSuffix);
-            if (prefixIndex == -1 || suffixIndex == -1) return;
-
-            sender = rawMessage.substring(prefixIndex + senderPrefix.length(), suffixIndex);
-            if (sender == mc.player.getName().getString()) return;
-            content = rawMessage.substring(suffixIndex + senderSuffix.length());
-        }
+    private static void handleMessage(String content, String sender) {
+        if (sender.equals(mc.player.getName().getString())) return;
 
         String[] colonSplit = content.replace(" ", "").split(":");
         String command = colonSplit[0];
-        // Register
+        // Register (received by a slave from the master; the socket connection
+        // itself proves the master is reachable, so no render distance check)
         if (command.equals("register") && master == null && toBeConfirmedSlaves.isEmpty()
-            && slaves.isEmpty() && canSeePlayer(sender)) {
+            && slaves.isEmpty()) {
             master = sender;
             SlaveSystem.queueMasterDM("accept");
         }
@@ -254,29 +362,17 @@ public final class SlaveSystem {
     }
 
     @EventHandler
-    private static void onReceivePacket(PacketEvent.Receive event) {
-        if (printerModule == null) return;
-
-        if (event.packet instanceof ChatMessageS2CPacket packet) {
-            handleMessage(packet.body().content(), packet.serializedParameters().name().getString());
-        }
-
-        if (event.packet instanceof GameMessageS2CPacket packet) {
-            handleMessage(packet.content().getString(), null);
-        }
-    }
-
-    @EventHandler
     private static void onTick(TickEvent.Pre event) {
+        if (printerModule == null) return;
         if (mc.getNetworkHandler() == null) return;
-        if (timeout > 0) timeout--;
-        if (!toBeSentMessages.isEmpty()) {
-            if (timeout <= 0) {
-                String message = toBeSentMessages.remove(0);
-                if (randomLength > 0) message += ":" + UUID.randomUUID().toString().substring(0, randomLength);
-                mc.getNetworkHandler().sendChatCommand(message);
-                timeout = commandDelay;
+
+        // Slave side: reconnect to the master when the connection drops
+        if (!isMasterMode()) {
+            if (reconnectTimer > 0) reconnectTimer--;
+            if (reconnectTimer == 0 && (client == null || client.isClosed())) {
+                ensureClient();
             }
         }
     }
 }
+

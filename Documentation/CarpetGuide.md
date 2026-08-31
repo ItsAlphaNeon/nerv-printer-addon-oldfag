@@ -66,10 +66,11 @@ To load a configuration, simply select the file and press the **Load** button. P
 
 ### Multi-User Printing
 The printer can orchestrate multiple accounts simultaneously to print a map on the same map area.  
-One bot acts as the **master** and instructs the other **slaves** via direct messages.
+One bot acts as the **master** and instructs the other **slaves** over WebSocket connections (no server chat / DMs involved, so no rate limiting or DM signature issues).
 
 **Setup:**
-1. Adjust the prefix and suffix in the settings. To circumvent DM signatures most servers use third-party DM plugins. As the syntax of them vary you will need to adjust pre- & suffix in the Multi-User-settings. Receiving DMs should look like this: (prefix)(sender's name)(suffix)(message)
-2. Enable the module and load the configuration on **every** bot.
-3. Move all slave bots into render distance of the master bot, then press the **Register** button using the master account. An **Accept** message should appear for each slave.
-4. Start the print in the usual way.
+1. On the **master** bot leave the *master-address* setting empty and pick a *master-port* (default 8080).
+2. On **every** slave bot set *master-address* to the master's IP address (e.g. `127.0.0.1` on the same PC, otherwise the master's LAN IP) and use the same *master-port*.
+3. Enable the module and load the configuration on **every** bot. The master starts a WebSocket server on activation; slaves connect automatically (with auto-reconnect).
+4. Press the **Register players in range** button using the master account once the slaves have connected. An **Accept** message should appear for each slave.
+5. Start the print in the usual way.

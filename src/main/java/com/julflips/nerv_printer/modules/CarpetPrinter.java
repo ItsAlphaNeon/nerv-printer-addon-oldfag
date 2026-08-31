@@ -306,48 +306,21 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
     //Multi User
 
-    private final Setting<String> directMessageCommand = sgMultiUser.add(new StringSetting.Builder()
-        .name("direct-message-command")
-        .description("The command used to send direct messages between master and slaves.")
-        .defaultValue("w")
-        .onChanged((value) -> SlaveSystem.directMessageCommand = value)
-        .build()
-    );
-
-    private final Setting<String> senderPrefix = sgMultiUser.add(new StringSetting.Builder()
-        .name("sender-prefix")
-        .description("The text that always comes before the name of sender of every direct message.")
-        .defaultValue("")
-        .onChanged((value) -> SlaveSystem.senderPrefix = value)
-        .build()
-    );
-
-    private final Setting<String> senderSuffix = sgMultiUser.add(new StringSetting.Builder()
-        .name("sender-suffix")
-        .description("The text that is always between the name of the sender and the actual message.")
-        .defaultValue(" whispers: ")
-        .onChanged((value) -> SlaveSystem.senderSuffix = value)
-        .build()
-    );
-
-    private final Setting<Integer> commandDelay = sgMultiUser.add(new IntSetting.Builder()
-        .name("chat-message-delay")
-        .description("How many ticks to wait between sending chat messages (for multi-user printing).")
-        .defaultValue(50)
+    private final Setting<Integer> masterPort = sgMultiUser.add(new IntSetting.Builder()
+        .name("master-port")
+        .description("Port used for the WebSocket connection between master and slaves.")
+        .defaultValue(8080)
         .min(1)
-        .sliderRange(1, 100)
-        .onChanged((value) -> SlaveSystem.commandDelay = value)
+        .sliderRange(1, 65535)
+        .onChanged(SlaveSystem::restartServer)
         .build()
     );
 
-    private final Setting<Integer> randomSuffix = sgMultiUser.add(new IntSetting.Builder()
-        .name("random-suffix-length")
-        .description("Generate a randomized suffix to circumvent anti-spam plugins.")
-        .defaultValue(0)
-        .min(0)
-        .max(36)
-        .sliderRange(0, 10)
-        .onChanged((value) -> SlaveSystem.randomLength = value)
+    private final Setting<String> masterAddress = sgMultiUser.add(new StringSetting.Builder()
+        .name("master-address")
+        .description("IP address of the master bot. Leave empty to host the WebSocket server as master.")
+        .defaultValue("")
+        .onChanged((value) -> SlaveSystem.masterAddress = value)
         .build()
     );
 
@@ -514,7 +487,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
         setInterval(new Pair<>(0, 127));
         // Initialize Slave System settings
-        SlaveSystem.setupSlaveSystem(this, commandDelay.get(), directMessageCommand.get(), senderPrefix.get(), senderSuffix.get(), randomSuffix.get());
+        SlaveSystem.setupSlaveSystem(this, masterPort.get(), masterAddress.get());
 
         if (!customFolderPath.get()) {
             mapFolder = new File(Utils.getMinecraftDirectory(), "nerv-printer");
