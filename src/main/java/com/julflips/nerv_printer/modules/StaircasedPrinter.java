@@ -1807,6 +1807,30 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         state = State.Walking;
     }
 
+    // Hivemind extensions - not supported by the staircased printer
+
+    public void broadcastSetup() {
+    }
+
+    public void slaveRegistered(String slave) {
+    }
+
+    public void applySetup(String json) {
+    }
+
+    public void applyMapData(String fileName, String base64) {
+    }
+
+    public void goToCorner(int cornerIndex) {
+    }
+
+    public void onIntervalsReassigned() {
+    }
+
+    public boolean isFinalizePhase() {
+        return false;
+    }
+
     // Path Change Check
 
     private void warnPathChanged() {

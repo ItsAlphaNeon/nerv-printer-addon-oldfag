@@ -8,6 +8,8 @@ import meteordevelopment.meteorclient.gui.widgets.pressable.WCheckbox;
 import meteordevelopment.meteorclient.gui.widgets.pressable.WMinus;
 import meteordevelopment.meteorclient.utils.render.color.Color;
 
+import java.util.LinkedHashSet;
+
 public final class SlaveTableController {
     private final WTable table;
     private final GuiTheme theme;
@@ -31,8 +33,14 @@ public final class SlaveTableController {
 
         table.add(theme.label("Multi-User: "));
 
-        WButton register = table.add(theme.button("Register players in range")).widget();
-        register.action = SlaveSystem::registerSlaves;
+        WButton register;
+        if (staircased) {
+            register = table.add(theme.button("Register players in range")).widget();
+            register.action = SlaveSystem::registerSlaves;
+        } else {
+            register = table.add(theme.button("Invite players in range")).widget();
+            register.action = SlaveSystem::invitePlayersInRange;
+        }
 
         WButton pause = table.add(theme.button("Pause all")).widget();
         pause.action = () -> {
@@ -43,6 +51,18 @@ public final class SlaveTableController {
         WButton start = table.add(theme.button("Start all")).widget();
         start.action = () -> {
             SlaveSystem.startAllSlaves();
+            rebuild();
+        };
+
+        WButton sendSetup = table.add(theme.button("Send Setup")).widget();
+        sendSetup.action = () -> {
+            SlaveSystem.broadcastSetup();
+            rebuild();
+        };
+
+        WButton status = table.add(theme.button("Hivemind Status")).widget();
+        status.action = () -> {
+            SlaveSystem.printHivemindStatus();
             rebuild();
         };
 
@@ -61,10 +81,12 @@ public final class SlaveTableController {
             table.row();
         }
 
-        for (String slave : SlaveSystem.slaves) {
-            WLabel name = table.add(theme.label(slave)).expandCellX().widget();
+        for (String slave : new LinkedHashSet<>(SlaveSystem.slaves)) {
+            boolean active = Boolean.TRUE.equals(SlaveSystem.activeSlavesDict.get(slave));
+            boolean finished = Boolean.TRUE.equals(SlaveSystem.finishedSlavesDict.get(slave));
+            WLabel name = table.add(theme.label(finished ? slave + " (finished)" : slave)).expandCellX().widget();
 
-            WCheckbox visible = table.add(theme.checkbox(SlaveSystem.activeSlavesDict.get(slave))).widget();
+            WCheckbox visible = table.add(theme.checkbox(active)).widget();
             visible.action = () -> {
                 SlaveSystem.activeSlavesDict.put(slave, visible.checked);
                 SlaveSystem.queueDM(slave, visible.checked ? "start" : "pause");

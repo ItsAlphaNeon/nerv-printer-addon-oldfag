@@ -36,6 +36,10 @@ public final class MasterSocketServer extends WebSocketServer {
 
     @Override
     public void onError(WebSocket conn, Exception ex) {
+        if (conn == null) {
+            // Server-level error (e.g. the bind failed) - nothing is listening
+            SlaveSystem.onServerError(ex.toString());
+        }
         LOG.error("Master socket error", ex);
     }
 

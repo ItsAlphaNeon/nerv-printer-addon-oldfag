@@ -1,9 +1,14 @@
 package com.julflips.nerv_printer.utils;
 
 import com.julflips.nerv_printer.interfaces.MapPrinter;
+import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.orbit.EventHandler;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.network.packet.s2c.play.ChatMessageS2CPacket;
+import net.minecraft.network.packet.s2c.play.GameMessageS2CPacket;
 import net.minecraft.util.Pair;
 import net.minecraft.util.math.BlockPos;
 import org.java_websocket.WebSocket;
@@ -20,6 +25,10 @@ public final class SlaveSystem {
 
     public static int masterPort = 8080;
     public static String masterAddress = "";
+    // Bootstrap invite transport (server DMs, only used to hand out connection details)
+    public static String directMessageCommand = "w";
+    public static String senderPrefix = "";
+    public static String senderSuffix = " whispers: ";
     public static ArrayList<String> slaves = new ArrayList<>();
     public static HashMap<String, Boolean> activeSlavesDict = new HashMap<>();
     public static HashMap<String, Boolean> finishedSlavesDict = new HashMap<>();
@@ -32,27 +41,101 @@ public final class SlaveSystem {
     // WebSocket transport
     private static MasterSocketServer server = null;
     private static volatile boolean serverStarted = false;
+    private static int serverRetryTimer = 0;
     private static SlaveSocketClient client = null;
     // Master side: connection -> slave player name (learned from the first message)
     private static final HashMap<WebSocket, String> slaveConnections = new HashMap<>();
     private static int reconnectTimer = 0;
+    private static int connectAttempts = 0;
+    // One-shot invite DM queue (spaced out to survive anti-spam plugins)
+    private static final ArrayList<String> toBeSentInvites = new ArrayList<>();
+    private static int inviteTimer = 0;
 
     public static void setupSlaveSystem(MapPrinter module, int port, String address) {
+        setupSlaveSystem(module, port, address, "w", "", " whispers: ");
+    }
+
+    public static void setupSlaveSystem(MapPrinter module, int port, String address, String dmCommand, String prefix, String suffix) {
+        boolean sameModule = printerModule == module;
+        if (!sameModule) {
+            // A different module instance takes over - reset the hive completely
+            slaves.clear();
+            toBeConfirmedSlaves.clear();
+            toBeSentInvites.clear();
+            activeSlavesDict.clear();
+            finishedSlavesDict.clear();
+            master = null;
+        }
         printerModule = module;
+        boolean portChanged = masterPort != port;
+        boolean addressChanged = !masterAddress.equals(address);
         masterPort = port;
         masterAddress = address;
-        slaves.clear();
-        toBeConfirmedSlaves.clear();
-        activeSlavesDict.clear();
-        finishedSlavesDict.clear();
-        master = null;
+        directMessageCommand = dmCommand;
+        senderPrefix = prefix;
+        senderSuffix = suffix;
 
-        // Role selection: an empty master-address means we host as the master,
-        // otherwise we connect to the configured master as a slave.
         if (isMasterMode()) {
+            // Re-activation of the same module must NOT wipe registered slaves:
+            // only restart the server if the port actually changed.
+            if (portChanged) stopServer();
             ensureServer();
         } else {
+            if (portChanged || addressChanged) stopClient();
             ensureClient();
+        }
+
+        if (sameModule) healStaleRegistrations();
+        printHivemindStatus();
+    }
+
+    /** Drops registered slaves whose socket connection is gone and re-splits the rows. */
+    private static void healStaleRegistrations() {
+        ArrayList<String> stale = new ArrayList<>();
+        for (String slave : slaves) {
+            if (!slaveConnections.containsValue(slave)) stale.add(slave);
+        }
+        if (stale.isEmpty()) return;
+        for (String slave : stale) {
+            slaves.removeIf(n -> n.equals(slave));
+            activeSlavesDict.remove(slave);
+            finishedSlavesDict.remove(slave);
+            ChatUtils.warning("Dropping stale slave registration: " + slave);
+        }
+        generateIntervals();
+    }
+
+    private static void stopClient() {
+        if (client != null) {
+            try {
+                client.close();
+            } catch (Exception ignored) {
+            }
+            client = null;
+        }
+        master = null;
+    }
+
+    /** Prints the current hivemind state to the local chat for quick diagnosis. */
+    public static void printHivemindStatus() {
+        if (printerModule == null) return;
+        if (isMasterMode()) {
+            if (!serverStarted) {
+                ChatUtils.info("Hivemind: hosting mode, but the socket server is NOT running.");
+            } else {
+                ChatUtils.info("Hivemind: hosting on port " + masterPort + " - "
+                    + slaveConnections.size() + " open connection(s), " + slaves.size() + " registered slave(s).");
+            }
+            for (String slave : slaves) {
+                ChatUtils.info("  Slave " + slave + " - finished: " + finishedSlavesDict.get(slave));
+            }
+            for (String pending : toBeConfirmedSlaves) {
+                ChatUtils.info("  Pending (connected, unregistered): " + pending);
+            }
+        } else {
+            ChatUtils.info("Hivemind: slave mode - " + (master != null ? "registered to " + master
+                : "not registered") + ", connection " + (client != null && client.isOpen() ? "open" : "closed")
+                + " to " + masterAddress.trim() + ":" + masterPort + ".");
         }
     }
 
@@ -90,13 +173,17 @@ public final class SlaveSystem {
     private static void ensureClient() {
         stopServer(); // never host while acting as a slave
         if (client != null && client.isOpen()) return;
-        if (client == null || client.isClosed()) {
-            try {
-                client = new SlaveSocketClient(new java.net.URI("ws://" + masterAddress.trim() + ":" + masterPort));
-            } catch (java.net.URISyntaxException e) {
-                ChatUtils.error("Invalid master address: " + masterAddress);
-                return;
-            }
+        if (masterAddress.trim().isEmpty()) return;
+        connectAttempts++;
+        ChatUtils.info("Connecting to master " + masterAddress.trim() + ":" + masterPort
+            + (connectAttempts > 1 ? " (attempt " + connectAttempts + ")" : "") + "...");
+        // Always create a fresh client object - closed WebSocketClients are not
+        // reliably re-connectable after a failed handshake.
+        try {
+            client = new SlaveSocketClient(new java.net.URI("ws://" + masterAddress.trim() + ":" + masterPort));
+        } catch (java.net.URISyntaxException e) {
+            ChatUtils.error("Invalid master address: " + masterAddress);
+            return;
         }
         // connect() blocks, so run it on its own thread
         new Thread(() -> {
@@ -116,6 +203,14 @@ public final class SlaveSystem {
     /** Called from the WebSocket server thread once the server socket is bound. */
     public static void onServerStarted() {
         serverStarted = true;
+        serverRetryTimer = 0;
+    }
+
+    /** Called from the WebSocket server thread when a server-level error occurs (e.g. bind failure). */
+    public static void onServerError(String message) {
+        serverStarted = false;
+        mc.execute(() -> ChatUtils.warning("Socket server failed: " + message
+            + " - is another instance still hosting on port " + masterPort + "? Retrying every 5s..."));
     }
 
     /** Called from the WebSocket server thread when a slave connection drops. */
@@ -123,7 +218,7 @@ public final class SlaveSystem {
         mc.execute(() -> {
             String name = slaveConnections.remove(conn);
             if (name != null && slaves.contains(name)) {
-                slaves.remove(name);
+                slaves.removeIf(n -> n.equals(name));
                 activeSlavesDict.remove(name);
                 finishedSlavesDict.remove(name);
                 toBeConfirmedSlaves.remove(name);
@@ -136,12 +231,32 @@ public final class SlaveSystem {
         });
     }
 
+    /** Called from the WebSocket client thread when the handshake succeeds. */
+    public static void onClientConnected() {
+        mc.execute(() -> {
+            connectAttempts = 0;
+            ChatUtils.info("Connected to master at " + masterAddress.trim() + ":" + masterPort + ". Awaiting registration...");
+        });
+    }
+
+    /** Called from the WebSocket client thread when a connection attempt errors out. */
+    public static void onConnectError(String message) {
+        mc.execute(() -> ChatUtils.warning("Connection to master " + masterAddress.trim() + ":" + masterPort
+            + " failed: " + message + " - retrying in 5s."));
+    }
+
+    /** Called from the WebSocket client thread when the handshake closed without ever opening. */
+    public static void onConnectNeverEstablished(String reason) {
+        mc.execute(() -> ChatUtils.warning("No connection detected to master " + masterAddress.trim() + ":"
+            + masterPort + (reason == null || reason.isEmpty() ? "" : " (" + reason + ")") + " - retrying in 5s."));
+    }
+
     /** Called from the WebSocket client thread when the master connection drops. */
     public static void onClientDisconnected() {
         mc.execute(() -> {
             if (master != null) {
                 master = null;
-                ChatUtils.warning("Lost connection to master.");
+                ChatUtils.warning("Lost connection to master - reconnecting in 5s.");
                 if (tableController != null) tableController.rebuild();
             }
         });
@@ -165,6 +280,10 @@ public final class SlaveSystem {
                 toBeConfirmedSlaves.add(sender);
                 ChatUtils.info("New connection: " + sender);
                 if (tableController != null) tableController.rebuild();
+                // Auto-register: the slave deliberately connected to this master's
+                // socket, so send the register handshake right away. The Register
+                // button remains available as a manual fallback.
+                sendToSocket(conn, "register");
             }
             handleMessage(content, sender);
         });
@@ -248,6 +367,10 @@ public final class SlaveSystem {
         if (printerModule != null) printerModule.skipBuilding();
     }
 
+    public static void broadcastSetup() {
+        if (printerModule != null) printerModule.broadcastSetup();
+    }
+
     public static void generateIntervals() {
         int sectionSize = (int) Math.ceil((float) 128 / (float) (slaves.size() + 1));
         ArrayList<Pair<Integer, Integer>> intervals = new ArrayList<>();
@@ -267,6 +390,30 @@ public final class SlaveSystem {
             String slave = sortedSlaves.get(i);
             SlaveSystem.queueDM(slave, "interval:" + intervals.get(i).getLeft() + ":" + intervals.get(i).getRight());
         }
+
+        // Hivemind: parked (already finished) slaves may have received new rows -
+        // re-activate them so the re-split rows actually get built.
+        printerModule.onIntervalsReassigned();
+    }
+
+    // ------------------------------------------------------------------
+    // Bootstrap invite (server DM transport, discovery only)
+    // ------------------------------------------------------------------
+
+    /** Resolves this machine's LAN IPv4 address so invites reach bots on other PCs. */
+    public static String resolveLocalIp() {
+        try {
+            for (java.net.NetworkInterface nic : Collections.list(java.net.NetworkInterface.getNetworkInterfaces())) {
+                if (!nic.isUp() || nic.isLoopback() || nic.isVirtual()) continue;
+                for (java.net.InetAddress addr : Collections.list(nic.getInetAddresses())) {
+                    if (addr instanceof java.net.Inet4Address && addr.isSiteLocalAddress()) {
+                        return addr.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "127.0.0.1";
     }
 
     public static void registerSlaves() {
@@ -280,6 +427,115 @@ public final class SlaveSystem {
         for (Map.Entry<WebSocket, String> entry : slaveConnections.entrySet()) {
             if (slaves.contains(entry.getValue())) continue;
             sendToSocket(entry.getKey(), "register");
+        }
+    }
+
+    /** Master side: DM the WebSocket connection details to every player in render distance. */
+    public static void invitePlayersInRange() {
+        if (printerModule == null) {
+            ChatUtils.warning("The module needs to be enabled to invite new slaves.");
+            return;
+        }
+        if (!isMasterMode()) {
+            ChatUtils.warning("You are not hosting - master-address is set. Clear it on the master bot.");
+            return;
+        }
+        if (!serverStarted) {
+            ChatUtils.warning("Socket server is not running yet - re-enable the module to start hosting.");
+            return;
+        }
+        String ip = resolveLocalIp();
+        ArrayList<String> foundPlayers = new ArrayList<>();
+        for (Entity entity : mc.world.getEntities()) {
+            if (entity instanceof PlayerEntity player && !mc.player.equals(player)) {
+                foundPlayers.add(player.getName().getString());
+            }
+        }
+        if (foundPlayers.isEmpty()) {
+            ChatUtils.warning("No players found in render distance.");
+            return;
+        }
+        int invited = 0;
+        for (String player : foundPlayers) {
+            if (slaves.contains(player)) continue;
+            toBeSentInvites.add(directMessageCommand + " " + player + " hivemind:" + ip + ":" + masterPort);
+            invited++;
+        }
+        if (invited > 0) {
+            ChatUtils.info("Invite sent to " + invited + " player(s): hivemind:" + ip + ":" + masterPort);
+        }
+    }
+
+    /** True if a player with this name is currently visible in render distance. */
+    private static boolean canSeePlayer(String playerName) {
+        for (Entity entity : mc.world.getEntities()) {
+            if (entity instanceof PlayerEntity player && player.getName().getString().equals(playerName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Slave side: parse a received invite and join the master's socket server. */
+    private static void handleInvite(String sender, String ip, String port) {
+        if (serverStarted) return;                                  // We host ourselves, ignore invites
+        if (client != null && client.isOpen()) return;              // Already connected
+        if (master != null) return;                                 // Already part of a hive
+        if (!canSeePlayer(sender)) return;                          // Anti-spoof: sender must be in render distance
+        int parsedPort;
+        try {
+            parsedPort = Integer.parseInt(port);
+        } catch (NumberFormatException e) {
+            return;
+        }
+        masterAddress = ip;
+        masterPort = parsedPort;
+        connectAttempts = 0;
+        ChatUtils.info("Joining hivemind of §a" + sender + "§7 at " + ip + ":" + parsedPort + "...");
+        ensureClient();
+    }
+
+    /** Master side: confirmation DM from a slave whose socket connection + registration succeeded. */
+    private static void handleInviteAccept(String sender) {
+        if (slaves.contains(sender)) {
+            ChatUtils.info("Slave §a" + sender + "§7 joined the hivemind via invite.");
+        } else {
+            ChatUtils.info(sender + " confirmed the invite (registration pending) - retrying registration...");
+            // Self-heal: re-send the register handshake to this connection
+            for (Map.Entry<WebSocket, String> entry : slaveConnections.entrySet()) {
+                if (entry.getValue().equals(sender)) {
+                    sendToSocket(entry.getKey(), "register");
+                    break;
+                }
+            }
+        }
+    }
+
+    /** Parses chat/system messages looking ONLY for hivemind bootstrap commands. */
+    private static void handleBootstrapMessage(String rawMessage, @Nullable String senderName) {
+        if (printerModule == null) return;
+        String content;
+        if (senderName != null) {
+            content = rawMessage;
+        } else {
+            int prefixIndex = rawMessage.indexOf(senderPrefix);
+            int suffixIndex = rawMessage.indexOf(senderSuffix);
+            if (prefixIndex == -1 || suffixIndex == -1 || suffixIndex < prefixIndex) return;
+            senderName = rawMessage.substring(prefixIndex + senderPrefix.length(), suffixIndex);
+            if (senderName.equals(mc.player.getName().getString())) return;
+            content = rawMessage.substring(suffixIndex + senderSuffix.length());
+        }
+        if (senderName == null || senderName.isEmpty()) return;
+        if (senderName.equals(mc.player.getName().getString())) return;
+
+        String compact = content.replace(" ", "").replace("\n", "");
+        if (compact.startsWith("hivemindaccept")) {
+            handleInviteAccept(senderName);
+            return;
+        }
+        String[] split = compact.split(":");
+        if (split.length >= 3 && split[0].equals("hivemind")) {
+            handleInvite(senderName, split[1], split[2]);
         }
     }
 
@@ -299,6 +555,21 @@ public final class SlaveSystem {
     private static void handleMessage(String content, String sender) {
         if (sender.equals(mc.player.getName().getString())) return;
 
+        // Bulk payload commands (JSON setup broadcast / base64 NBT map transfer)
+        // are only meaningful from the master to a slave.
+        if (sender.equals(master)) {
+            if (content.startsWith("config:")) {
+                printerModule.applySetup(content.substring("config:".length()));
+                return;
+            }
+            if (content.startsWith("map:")) {
+                String[] mapSplit = content.substring("map:".length()).split(":", 2);
+                if (mapSplit.length < 2) return;
+                printerModule.applyMapData(mapSplit[0], mapSplit[1]);
+                return;
+            }
+        }
+
         String[] colonSplit = content.replace(" ", "").split(":");
         String command = colonSplit[0];
         // Register (received by a slave from the master; the socket connection
@@ -307,6 +578,8 @@ public final class SlaveSystem {
             && slaves.isEmpty()) {
             master = sender;
             SlaveSystem.queueMasterDM("accept");
+            // Bootstrap confirmation back over the server DM channel
+            toBeSentInvites.add(directMessageCommand + " " + master + " hivemindaccept");
         }
         // Master to Client message
         if (sender.equals(master)) {
@@ -314,6 +587,7 @@ public final class SlaveSystem {
                 case "interval":
                     if (colonSplit.length < 3) break;
                     Pair<Integer, Integer> interval = new Pair<>(Integer.valueOf(colonSplit[1]), Integer.valueOf(colonSplit[2]));
+                    ChatUtils.info("Received rows " + colonSplit[1] + "-" + colonSplit[2] + " from master.");
                     printerModule.setInterval(interval);
                     break;
                 case "pause":
@@ -338,12 +612,20 @@ public final class SlaveSystem {
         if (slaves.contains(sender) || toBeConfirmedSlaves.contains(sender)) {
             switch (command) {
                 case "accept":
+                    if (slaves.contains(sender)) {
+                        // Idempotent: a reconnecting slave may re-accept; adding it
+                        // twice would duplicate rows and corrupt interval assignment
+                        ChatUtils.info("Ignored duplicate registration from: " + sender);
+                        toBeConfirmedSlaves.remove(sender);
+                        break;
+                    }
                     slaves.add(sender);
                     finishedSlavesDict.put(sender, false);
                     activeSlavesDict.put(sender, false);
                     toBeConfirmedSlaves.remove(sender);
                     ChatUtils.info("Registered slave: " + sender + " Total slaves: " + slaves.size());
                     generateIntervals();
+                    printerModule.slaveRegistered(sender);
                     if (tableController != null) tableController.rebuild();
                     break;
                 case "finished":
@@ -362,15 +644,48 @@ public final class SlaveSystem {
     }
 
     @EventHandler
+    private static void onReceivePacket(PacketEvent.Receive event) {
+        if (printerModule == null) return;
+
+        // Bootstrap invite detection (one-time DM transport)
+        if (event.packet instanceof ChatMessageS2CPacket packet) {
+            handleBootstrapMessage(packet.body().content(), packet.serializedParameters().name().getString());
+        }
+        if (event.packet instanceof GameMessageS2CPacket packet) {
+            handleBootstrapMessage(packet.content().getString(), null);
+        }
+    }
+
+    @EventHandler
     private static void onTick(TickEvent.Pre event) {
         if (printerModule == null) return;
         if (mc.getNetworkHandler() == null) return;
+
+        // Send queued hivemind invites, spaced out to survive anti-spam plugins
+        if (!toBeSentInvites.isEmpty()) {
+            if (inviteTimer > 0) inviteTimer--;
+            if (inviteTimer == 0) {
+                String message = toBeSentInvites.remove(0);
+                mc.getNetworkHandler().sendChatCommand(message);
+                inviteTimer = 40;
+            }
+        }
 
         // Slave side: reconnect to the master when the connection drops
         if (!isMasterMode()) {
             if (reconnectTimer > 0) reconnectTimer--;
             if (reconnectTimer == 0 && (client == null || client.isClosed())) {
                 ensureClient();
+            }
+        } else {
+            // Master side: watchdog - retry the server bind every 5s until it succeeds
+            // (covers bind failures from port conflicts and zombie sockets after crashes)
+            if (!serverStarted) {
+                if (serverRetryTimer > 0) serverRetryTimer--;
+                if (serverRetryTimer == 0) {
+                    ensureServer();
+                    serverRetryTimer = 100;
+                }
             }
         }
     }

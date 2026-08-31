@@ -64,13 +64,21 @@ If you still need help: There is a YouTube video demonstrating the process (in s
 Register the blocks as usual, then press **Save Config** in the module settings when you are finished.  
 To load a configuration, simply select the file and press the **Load** button. Printing is started in the usual way.
 
-### Multi-User Printing
-The printer can orchestrate multiple accounts simultaneously to print a map on the same map area.  
-One bot acts as the **master** and instructs the other **slaves** over WebSocket connections (no server chat / DMs involved, so no rate limiting or DM signature issues).
+### Multi-User Printing (Hivemind)
+The printer can orchestrate multiple accounts simultaneously to print a map on the same map area.
+One bot acts as the **master** and works alongside the other **slaves**, coordinating everything over WebSocket connections (no server chat / DMs involved, so no rate limiting or DM signature issues).
+
+- Only **one setup is needed**, on the master: map area, reset button, perimeter corners, dump station, cartography table, finished-map chest and material chests are all transmitted to every slave automatically (`Send Setup` button / auto on slave registration).
+- Only the master loads **nbt files** - the map data is transmitted to the slaves over WebSocket as well. Slaves need no local nbt files.
+- Rows (0-127) are **dynamically assigned** to master + slaves. If a slave disconnects, its rows are re-split among the remaining bots instantly (the master falls back to building the full map alone until slaves reconnect). Partially built lines are picked up automatically.
+- Only the **master finalizes**: it dumps, crafts the map and **wipes the map area** (reset button + perimeter walk). When a slave finishes its rows it reports `finished` and parks at one of the assigned **perimeter corners**, keeping its leftover materials so it can be re-assigned instantly.
+- Slaves **restock on demand**: they use their current materials as long as possible and only walk to the material chests (positions received from the master) when they can no longer finish their rows.
 
 **Setup:**
 1. On the **master** bot leave the *master-address* setting empty and pick a *master-port* (default 8080).
-2. On **every** slave bot set *master-address* to the master's IP address (e.g. `127.0.0.1` on the same PC, otherwise the master's LAN IP) and use the same *master-port*.
-3. Enable the module and load the configuration on **every** bot. The master starts a WebSocket server on activation; slaves connect automatically (with auto-reconnect).
-4. Press the **Register players in range** button using the master account once the slaves have connected. An **Accept** message should appear for each slave.
-5. Start the print in the usual way.
+2. On **every** slave bot just enable the Carpet Printer module - no address is needed if you use the invite flow.
+3. Enable the module on every bot. The master starts a WebSocket server on activation; slaves stay in slave mode until invited.
+4. Complete the station setup **on the master only** (or load a config).
+5. Move all bots into render distance of each other, then press **Invite players in range** on the master. The master sends each nearby bot a one-time DM containing its IP and port; slaves automatically connect to the WebSocket server, register themselves and confirm back (`Slave <name> joined the hivemind via invite.`). The setup is broadcast to them automatically.
+   - Only needed if DMs are blocked on your server: manually set *master-address* to the master's IP on each slave bot (e.g. `127.0.0.1` on the same PC, otherwise the master's LAN IP) and use the same *master-port*.
+6. Start the print in the usual way (`.startprinter`). The master transmits the map, splits the rows and starts everyone.

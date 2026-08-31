@@ -13,6 +13,7 @@ import java.net.URI;
  */
 public final class SlaveSocketClient extends WebSocketClient {
     private static final Logger LOG = LoggerFactory.getLogger(SlaveSocketClient.class);
+    private boolean handshakeCompleted = false;
 
     public SlaveSocketClient(URI uri) {
         super(uri);
@@ -20,13 +21,19 @@ public final class SlaveSocketClient extends WebSocketClient {
 
     @Override
     public void onOpen(ServerHandshake handshake) {
+        handshakeCompleted = true;
+        SlaveSystem.onClientConnected();
         // Introduce ourselves so the master can map this connection to a player name
         send("s:" + meteordevelopment.meteorclient.MeteorClient.mc.player.getName().getString() + ":connect");
     }
 
     @Override
     public void onClose(int code, String reason, boolean remote) {
-        SlaveSystem.onClientDisconnected();
+        if (handshakeCompleted) {
+            SlaveSystem.onClientDisconnected();
+        } else {
+            SlaveSystem.onConnectNeverEstablished(reason);
+        }
     }
 
     @Override
@@ -36,6 +43,10 @@ public final class SlaveSocketClient extends WebSocketClient {
 
     @Override
     public void onError(Exception ex) {
-        LOG.error("Slave socket error", ex);
+        if (handshakeCompleted) {
+            LOG.error("Slave socket error", ex);
+        } else {
+            SlaveSystem.onConnectError(ex.toString());
+        }
     }
 }

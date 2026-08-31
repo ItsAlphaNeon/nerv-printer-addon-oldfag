@@ -22,6 +22,23 @@ import java.util.Set;
 
 public final class ConfigSerializer {
 
+    public static String toJsonString(
+        String type,
+        Pair<BlockPos, Vec3d> reset,
+        Pair<BlockPos, Vec3d> cartographyTable,
+        Pair<BlockPos, Vec3d> finishedMapChest,
+        ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests,
+        Pair<Vec3d, Pair<Float, Float>> dumpStation,
+        BlockPos mapCorner,
+        HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
+        ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners
+    ) {
+        JsonObject root = buildRoot(type, reset, cartographyTable, finishedMapChest, null, null,
+            mapMaterialChests, dumpStation, mapCorner, materialDict, null, perimeterCorners);
+        Gson gson = new GsonBuilder().create();
+        return gson.toJson(root);
+    }
+
     private static JsonObject blockPosToJson(BlockPos pos) {
         JsonObject obj = new JsonObject();
         obj.addProperty("x", pos.getX());
@@ -108,6 +125,28 @@ public final class ConfigSerializer {
         Set<ItemStack> toolSet,
         ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners
     ) throws IOException {
+        JsonObject root = buildRoot(type, reset, cartographyTable, finishedMapChest, usedToolChest, bed,
+            mapMaterialChests, dumpStation, mapCorner, materialDict, toolSet, perimeterCorners);
+        Gson gson = new GsonBuilder().setPrettyPrinting().create();
+        try (Writer writer = Files.newBufferedWriter(file)) {
+            gson.toJson(root, writer);
+        }
+    }
+
+    private static JsonObject buildRoot(
+        String type,
+        Pair<BlockPos, Vec3d> reset,
+        Pair<BlockPos, Vec3d> cartographyTable,
+        Pair<BlockPos, Vec3d> finishedMapChest,
+        Pair<BlockPos, Vec3d> usedToolChest,
+        Pair<BlockPos, Vec3d> bed,
+        ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests,
+        Pair<Vec3d, Pair<Float, Float>> dumpStation,
+        BlockPos mapCorner,
+        HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
+        Set<ItemStack> toolSet,
+        ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners
+    ) {
         JsonObject root = new JsonObject();
 
         root.addProperty("type", type);
@@ -168,9 +207,6 @@ public final class ConfigSerializer {
             root.add("perimeterCorners", cornersArray);
         }
 
-        Gson gson = new GsonBuilder().setPrettyPrinting().create();
-        try (Writer writer = Files.newBufferedWriter(file)) {
-            gson.toJson(root, writer);
-        }
+        return root;
     }
 }

@@ -24,4 +24,20 @@ public interface MapPrinter {
     void skipBuilding();
 
     void slaveFinished(String slave);
+
+    // Hivemind extensions (WebSocket transport)
+
+    void broadcastSetup();
+
+    void slaveRegistered(String slave);
+
+    void applySetup(String json);
+
+    void applyMapData(String fileName, String base64);
+
+    void goToCorner(int cornerIndex);
+
+    void onIntervalsReassigned();
+
+    boolean isFinalizePhase();
 }

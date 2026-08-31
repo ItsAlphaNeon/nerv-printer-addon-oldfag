@@ -68,12 +68,24 @@ public final class ConfigDeserializer {
             : null;
     }
 
+    public static ConfigData readFromString(String json) {
+        Gson gson = new Gson();
+        JsonObject root = gson.fromJson(json, JsonObject.class);
+        if (root == null) return null;
+        return parseRoot(root);
+    }
+
     public static ConfigData readFromJson(Path file) throws IOException {
         Gson gson = new Gson();
 
         try (Reader reader = Files.newBufferedReader(file)) {
             JsonObject root = gson.fromJson(reader, JsonObject.class);
-            ConfigData data = new ConfigData();
+            return parseRoot(root);
+        }
+    }
+
+    private static ConfigData parseRoot(JsonObject root) {
+        ConfigData data = new ConfigData();
 
             data.type = root.get("type").getAsString();
 
@@ -147,6 +159,5 @@ public final class ConfigDeserializer {
             }
 
             return data;
-        }
     }
 }

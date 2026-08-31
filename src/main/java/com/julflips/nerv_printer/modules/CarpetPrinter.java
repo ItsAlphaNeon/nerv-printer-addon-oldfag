@@ -324,6 +324,32 @@ public class CarpetPrinter extends Module implements MapPrinter {
         .build()
     );
 
+    // Chat transport used ONLY for the bootstrap invite (hivemind:<ip>:<port>)
+
+    private final Setting<String> directMessageCommand = sgMultiUser.add(new StringSetting.Builder()
+        .name("direct-message-command")
+        .description("The command used to send the one-time hivemind invite via server DMs.")
+        .defaultValue("w")
+        .onChanged((value) -> SlaveSystem.directMessageCommand = value)
+        .build()
+    );
+
+    private final Setting<String> senderPrefix = sgMultiUser.add(new StringSetting.Builder()
+        .name("sender-prefix")
+        .description("The text that always comes before the name of the sender of every direct message.")
+        .defaultValue("")
+        .onChanged((value) -> SlaveSystem.senderPrefix = value)
+        .build()
+    );
+
+    private final Setting<String> senderSuffix = sgMultiUser.add(new StringSetting.Builder()
+        .name("sender-suffix")
+        .description("The text that is always between the name of the sender and the actual message.")
+        .defaultValue(" whispers: ")
+        .onChanged((value) -> SlaveSystem.senderSuffix = value)
+        .build()
+    );
+
     //Error Handling
 
     private final Setting<Boolean> logErrors = sgError.add(new BoolSetting.Builder()
@@ -440,6 +466,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
     Block[][] map;
     File mapFolder;
     File mapFile;
+    boolean pendingStart;               // Slave: start received before the map transfer
+    boolean pendingSetupBroadcast;      // Master: broadcast config as soon as the setup completes
+    boolean finalizePhase;              // Master: currently dumping/cartoing/wiping (slaves are parked)
+    int cornerCounter;                  // Master: round-robin counter for perimeter corner assignment
 
     public CarpetPrinter() {
         super(Addon.CATEGORY, "carpet-printer", "Automatically builds 2D carpet maps from nbt files.");
@@ -482,12 +512,17 @@ public class CarpetPrinter extends Module implements MapPrinter {
         debugWipeOnly = false;
         expectButtonPress = false;
         isWiping = false;
+        pendingStart = false;
+        pendingSetupBroadcast = false;
+        finalizePhase = false;
+        cornerCounter = 0;
         oldState = null;
         debugPreviousState = null;
 
         setInterval(new Pair<>(0, 127));
         // Initialize Slave System settings
-        SlaveSystem.setupSlaveSystem(this, masterPort.get(), masterAddress.get());
+        SlaveSystem.setupSlaveSystem(this, masterPort.get(), masterAddress.get(),
+            directMessageCommand.get(), senderPrefix.get(), senderSuffix.get());
 
         if (!customFolderPath.get()) {
             mapFolder = new File(Utils.getMinecraftDirectory(), "nerv-printer");
@@ -496,6 +531,14 @@ public class CarpetPrinter extends Module implements MapPrinter {
         }
         if (!Utils.createFolders(mapFolder)) {
             toggle();
+            return;
+        }
+
+        // Hivemind slave mode: no local setup and no local nbt files are needed.
+        // The master transmits the station config and the map data via WebSocket.
+        if (!SlaveSystem.isMasterMode()) {
+            state = State.AwaitSetup;
+            info("Hivemind slave mode: waiting for setup from master " + masterAddress.get() + "...");
             return;
         }
 
@@ -798,8 +841,21 @@ public class CarpetPrinter extends Module implements MapPrinter {
             if (debugPrints.get()) info("State changed to: §a" + state);
         }
 
+        // Auto-broadcast the config once the setup completes (slaves may have
+        // registered before the master finished its own setup)
+        if (pendingSetupBroadcast && state.equals(State.SelectingChests) && hasFullSetup()) {
+            pendingSetupBroadcast = false;
+            broadcastSetup();
+        }
+
         if (state.equals(State.AwaitMasterAllBuilt)) {
-            if (SlaveSystem.allSlavesFinished()) {
+            // Rows may have become unfinished (re-split after a slave change) - resume
+            // building, but only if the unfinished rows are inside OUR OWN interval.
+            // Rows still being built by other bots are their job; don't churn here.
+            if (hasUnfinishedRowsInInterval()) {
+                calculateBuildingPath(startNorthToSouth.get(), true);
+                state = State.Walking;
+            } else if (SlaveSystem.allSlavesFinished()) {
                 if (!endBuilding()) return;
             } else {
                 return;
@@ -868,6 +924,17 @@ public class CarpetPrinter extends Module implements MapPrinter {
         // Restocking
         if (restockBacklogSlots.size() > 0) {
             int slot = restockBacklogSlots.remove(0);
+            // Stale screen guard: the backlog slots were captured from a previous
+            // chest inventory. If the bot was interrupted (screen closed) or the
+            // chest changed size (single vs double chest), the indices no longer
+            // match the current screen handler - clicking them crashes the game.
+            if (slot >= mc.player.currentScreenHandler.slots.size()) {
+                warning("Stale chest slots detected (screen changed). Re-opening the chest...");
+                restockBacklogSlots.clear();
+                interactWithBlock(lastInteractedBlockPos);
+                state = State.AwaitRestockResponse;
+                return;
+            }
             mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, slot, 1, SlotActionType.QUICK_MOVE, mc.player);
             if (restockBacklogSlots.isEmpty()) {
                 if (state.equals(State.AwaitRestockResponse)) {
@@ -933,6 +1000,15 @@ public class CarpetPrinter extends Module implements MapPrinter {
         // Load next nbt file
         if (state == State.AwaitNBTFile) {
             if (!prepareNextMapFile()) return;
+            // Hivemind: transmit the map, re-split rows and start the slaves
+            if (!SlaveSystem.isSlave()) {
+                if (SlaveSystem.slaves.isEmpty()) {
+                    info("No slaves connected - single-user fallback (building the full map alone).");
+                } else {
+                    for (String slave : SlaveSystem.slaves) sendMapTo(slave);
+                }
+                SlaveSystem.generateIntervals();
+            }
             startBuilding();
         }
 
@@ -1044,10 +1120,17 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     return;
                 case "refill":
                     state = State.AwaitRestockResponse;
+                    // A fresh chest interaction invalidates any stale backlog slots
+                    restockBacklogSlots.clear();
                     interactWithBlock(checkpointAction.getRight());
                     return;
                 case "awaitClear":
                     state = State.AwaitAreaClear;
+                    Utils.setForwardPressed(false);
+                    return;
+                case "parkCorner":
+                    // Slave is parked at its perimeter corner, waiting for the master
+                    state = State.AwaitSlaveNextMap;
                     Utils.setForwardPressed(false);
                     return;
                 case "break":
@@ -1355,6 +1438,17 @@ public class CarpetPrinter extends Module implements MapPrinter {
             }
         }
         if (lastSwappedMaterial == material) return false;      //Wait for swapped material
+        if (SlaveSystem.isSlave()) {
+            // Slaves keep their leftovers and restock only what is actually
+            // missing for their current rows (walk to the material chest themselves).
+            HashMap<Item, Integer> requiredItems = getRequiredItems();
+            Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInformation = Utils.getInvInformation(requiredItems, availableSlots);
+            refillInventory(invInformation.getRight());
+            if (!checkpoints.isEmpty() && checkpoints.get(0).getRight().getLeft().equals("refill")) {
+                Utils.setForwardPressed(false);
+            }
+            return false;
+        }
         info("No " + material.getName().getString() + " found in inventory. Resetting...");
         checkpoints.add(0, new Pair(mc.player.getEntityPos(), new Pair("sprint", null)));
         checkpoints.add(0, new Pair(dumpStation.getLeft(), new Pair("dump", null)));
@@ -1403,17 +1497,28 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     private void startBuilding() {
-        if (!SlaveSystem.isSlave()) SlaveSystem.startAllSlaves();
+        finalizePhase = false;
+        if (!SlaveSystem.isSlave()) {
+            // Hivemind: (re-)transmit the map to every registered slave, then start them
+            if (hasFullSetup() && mapFile != null) {
+                for (String slave : SlaveSystem.slaves) sendMapTo(slave);
+            }
+            SlaveSystem.startAllSlaves();
+        }
         if (availableSlots.isEmpty()) setupSlots();
         MapAreaCache.reset(mapCorner);
         isWiping = false;
         calculateBuildingPath(startNorthToSouth.get(), true);
-        checkpoints.add(0, new Pair(dumpStation.getLeft(), new Pair("dump", null)));
+        // Slaves keep their leftover materials (no dump trip) so they can be
+        // re-assigned instantly; they restock on demand instead.
+        if (!SlaveSystem.isSlave()) checkpoints.add(0, new Pair(dumpStation.getLeft(), new Pair("dump", null)));
         state = State.Walking;
     }
 
     private boolean endBuilding() {
         info("Finished building map");
+        finalizePhase = true;
+        cornerCounter = 0;
         state = State.Walking;
         knownErrors.clear();
         SlaveSystem.setAllSlavesUnfinished();
@@ -1711,6 +1816,24 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     public void start() {
+        if (SlaveSystem.isSlave()) {
+            // Resume after a pause
+            if (state.equals(State.AwaitSlaveContinue) && oldState != null && map != null
+                && (oldState == State.Walking || oldState == State.Dumping)) {
+                state = oldState;
+                pendingStart = false;
+                return;
+            }
+            // Fresh start from a parked/waiting state
+            if (map != null && hasFullSetup()) {
+                pendingStart = false;
+                startBuilding();
+            } else {
+                pendingStart = true;
+                if (state != State.AwaitMasterMap) state = State.AwaitMasterMap;
+            }
+            return;
+        }
         if (availableSlots.isEmpty() || state.equals(State.AwaitSlaveNextMap)) {
             state = State.AwaitNBTFile;
             return;
@@ -1731,6 +1854,171 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     public void slaveFinished(String slave) {
+        // Master assigns the finished slave one of the perimeter corners to park at
+        if (perimeterCorners.isEmpty()) return;
+        int corner = cornerCounter % perimeterCorners.size();
+        cornerCounter++;
+        SlaveSystem.queueDM(slave, "goToCorner:" + corner);
+    }
+
+    // Hivemind extensions (WebSocket transport)
+
+    private boolean hasFullSetup() {
+        return resetButton != null && cartographyTable != null && finishedMapChest != null
+            && dumpStation != null && mapCorner != null && !materialDict.isEmpty()
+            && !mapMaterialChests.isEmpty() && perimeterCorners.size() >= 4;
+    }
+
+    @Override
+    public void broadcastSetup() {
+        if (SlaveSystem.isSlave()) return;
+        if (!hasFullSetup()) {
+            warning("Setup incomplete, cannot broadcast to slaves.");
+            return;
+        }
+        if (SlaveSystem.slaves.isEmpty()) {
+            warning("No registered slaves to broadcast to.");
+            return;
+        }
+        SlaveSystem.sendToAllSlaves("config:" + ConfigSerializer.toJsonString(
+            "carpet", resetButton, cartographyTable, finishedMapChest, mapMaterialChests,
+            dumpStation, mapCorner, materialDict, perimeterCorners));
+        info("Setup broadcast to " + SlaveSystem.slaves.size() + " slave(s).");
+    }
+
+    @Override
+    public void slaveRegistered(String slave) {
+        if (SlaveSystem.isSlave()) return;
+        if (!hasFullSetup()) {
+            // Setup not done yet - remember to broadcast automatically once it is
+            pendingSetupBroadcast = true;
+            info("Slave " + slave + " registered - setup incomplete, will broadcast automatically when ready.");
+            return;
+        }
+
+        // Welcome packet: setup, current map (if one is active) and a fresh interval.
+        SlaveSystem.queueDM(slave, "config:" + ConfigSerializer.toJsonString(
+            "carpet", resetButton, cartographyTable, finishedMapChest, mapMaterialChests,
+            dumpStation, mapCorner, materialDict, perimeterCorners));
+
+        if (finalizePhase) {
+            // The map is being finalized/wiped - park the newcomer at a corner,
+            // it will be put to work with the next map.
+            int corner = cornerCounter % perimeterCorners.size();
+            cornerCounter++;
+            SlaveSystem.queueDM(slave, "goToCorner:" + corner);
+            return;
+        }
+
+        if (map != null && mapFile != null && (state == State.Walking || state == State.Dumping || state == State.AwaitMasterAllBuilt)) {
+            sendMapTo(slave);
+            SlaveSystem.queueDM(slave, "start");
+        }
+    }
+
+    private void sendMapTo(String slave) {
+        try {
+            byte[] bytes = java.nio.file.Files.readAllBytes(mapFile.toPath());
+            SlaveSystem.queueDM(slave, "map:" + mapFile.getName() + ":" + Base64.getEncoder().encodeToString(bytes));
+        } catch (Exception e) {
+            warning("Failed to read map file for transmission: " + mapFile.getName());
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void applySetup(String json) {
+        try {
+            ConfigDeserializer.ConfigData data = ConfigDeserializer.readFromString(json);
+            if (data == null || !data.type.equals("carpet") || data.mapCorner == null
+                || data.resetButton == null || data.cartographyTable == null
+                || data.finishedMapChest == null || data.dumpStation == null
+                || data.materialDict.isEmpty() || data.perimeterCorners.size() < 4) {
+                warning("Received incomplete setup from master.");
+                return;
+            }
+            this.resetButton = data.resetButton;
+            this.cartographyTable = data.cartographyTable;
+            this.finishedMapChest = data.finishedMapChest;
+            this.mapMaterialChests = data.mapMaterialChests;
+            this.dumpStation = data.dumpStation;
+            this.mapCorner = data.mapCorner;
+            MapAreaCache.reset(mapCorner);
+            this.materialDict = data.materialDict;
+            this.perimeterCorners = (ArrayList<Pair<BlockPos, Vec3d>>) data.perimeterCorners;
+            info("Setup received from master.");
+            if (state == null || state == State.AwaitSetup) state = State.AwaitMasterMap;
+        } catch (Exception e) {
+            warning("Failed to parse setup from master.");
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void applyMapData(String fileName, String base64) {
+        if (!SlaveSystem.isSlave()) return;
+        try {
+            // Skip a redundant re-send while already building the same map
+            if (mapFile != null && mapFile.getName().equals(fileName) && map != null
+                && (state == State.Walking || state == State.Dumping)) return;
+
+            byte[] bytes = Base64.getDecoder().decode(base64);
+            File target = new File(mapFolder, fileName);
+            java.nio.file.Files.write(target.toPath(), bytes);
+            mapFile = target;
+            startedFiles.add(target);
+            info("Receiving map §a" + fileName + "§7 from master...");
+            if (!loadNBTFile()) {
+                warning("Failed to load received map file.");
+                return;
+            }
+            if (pendingStart && hasFullSetup()) {
+                pendingStart = false;
+                startBuilding();
+            } else if (state == State.AwaitMasterMap || state == State.AwaitSetup) {
+                state = State.AwaitMasterMap;
+            }
+        } catch (Exception e) {
+            warning("Failed to process map data from master.");
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void goToCorner(int cornerIndex) {
+        if (!SlaveSystem.isSlave() || perimeterCorners.size() <= cornerIndex) return;
+        Pair<BlockPos, Vec3d> corner = perimeterCorners.get(cornerIndex);
+        checkpoints.clear();
+        checkpoints.add(new Pair<>(corner.getRight(), new Pair<>("parkCorner", null)));
+        state = State.Walking;
+        info("Walking to perimeter corner " + (cornerIndex + 1) + " to wait for the master...");
+    }
+
+    @Override
+    public void onIntervalsReassigned() {
+        if (SlaveSystem.isSlave() || finalizePhase) return;
+        // Re-activate parked slaves that received new rows from the re-split
+        for (String slave : SlaveSystem.slaves) {
+            if (Boolean.TRUE.equals(SlaveSystem.finishedSlavesDict.get(slave))) {
+                SlaveSystem.queueDM(slave, "start");
+            }
+        }
+    }
+
+    @Override
+    public boolean isFinalizePhase() {
+        return finalizePhase;
+    }
+
+    private boolean hasUnfinishedRowsInInterval() {
+        if (map == null || mapCorner == null || workingInterval == null) return false;
+        for (int x = workingInterval.getLeft(); x <= workingInterval.getRight(); x++) {
+            for (int z = 0; z < 128; z++) {
+                if (map[x][z] == null) continue;
+                if (MapAreaCache.getCachedBlockState(mapCorner.add(x, 0, z)).isAir()) return true;
+            }
+        }
+        return false;
     }
 
     // Path Change Check
@@ -1830,6 +2118,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
             info(Text.literal("Successfully loaded config: ").append(configText));
             info("Type .startprinter to start printing.");
             state = State.SelectingChests;
+            // Slaves may have registered before the config existed - broadcast it now
+            if (!SlaveSystem.isSlave() && !SlaveSystem.slaves.isEmpty()) pendingSetupBroadcast = true;
         } catch (IOException e) {
             error("Failed to read config file.");
         }
@@ -2020,6 +2310,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
         AwaitBlockBreak,
         AwaitAreaClear,
         AwaitNBTFile,
+        AwaitSetup,
+        AwaitMasterMap,
         AwaitMasterAllBuilt,
         AwaitSlaveContinue,
         AwaitSlaveNextMap,
