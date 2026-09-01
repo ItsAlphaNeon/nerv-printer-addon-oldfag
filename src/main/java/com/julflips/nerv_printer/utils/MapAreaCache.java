@@ -17,6 +17,7 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
 public final class MapAreaCache {
     private static BlockPos mapCorner = null;
     private static Map<ChunkPos, Chunk> cachedChunks = new HashMap<>();
+    private static long lastFallbackWarning = 0;
 
     public static boolean isWithingMap(BlockPos pos) {
         BlockPos relativePos = pos.subtract(mapCorner);
@@ -50,19 +51,38 @@ public final class MapAreaCache {
         cachedChunks.clear();
     }
 
+    /**
+     * Legacy lookup. NEVER use this for "is the map done?" checks - it falls back
+     * to the client's placeholder (air) state for unloaded chunks, which makes
+     * unbuilt rows look finished. Use {@link #getVerifiedBlockState} instead.
+     */
     public static BlockState getCachedBlockState(BlockPos blockPos) {
+        BlockState verified = getVerifiedBlockState(blockPos);
+        if (verified != null) return verified;
+        // Unknown chunk - the old behavior returned the placeholder (air) state.
+        // Rate-limit the warning: this used to spam per call.
+        long now = System.currentTimeMillis();
+        if (now - lastFallbackWarning >= 5000) {
+            lastFallbackWarning = now;
+            ChatUtils.warning("Could not fetch Block at " + blockPos.toShortString() + ". Try loading the entire Map Area first.");
+        }
+        return mc.world.getBlockState(blockPos);
+    }
+
+    /**
+     * Returns the block state, or {@code null} when the chunk is neither loaded
+     * nor cached (i.e. the state is UNKNOWN). Callers doing completion checks
+     * must treat null as "not finished / cannot verify" - never as air.
+     */
+    public static BlockState getVerifiedBlockState(BlockPos blockPos) {
         int chunkX = blockPos.getX() >> 4;
         int chunkZ = blockPos.getZ() >> 4;
         if (mc.world.getChunkManager().isChunkLoaded(chunkX, chunkZ)) {
             return mc.world.getBlockState(blockPos);
         }
         ChunkPos chunkPos = new ChunkPos(chunkX, chunkZ);
-        if (cachedChunks.containsKey(chunkPos)) {
-            Chunk chunk = cachedChunks.get(chunkPos);
-            return chunk.getBlockState(blockPos);
-        }
-        ChatUtils.warning("Could not fetch Block at " + blockPos.toShortString() + ". Try loading the entire Map Area first.");
-        return mc.world.getBlockState(blockPos);
+        Chunk chunk = cachedChunks.get(chunkPos);
+        return chunk != null ? chunk.getBlockState(blockPos) : null;
     }
 
     @EventHandler()

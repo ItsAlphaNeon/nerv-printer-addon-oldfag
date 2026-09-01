@@ -1831,10 +1831,32 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     public void onSlaveProgress(String slave, int unfinishedRows) {
     }
 
+    public boolean usesAfkAnchorRows() {
+        return false;
+    }
+
+    public void runFinalize() {
+    }
+
+    @Override
+    public void runVerify() {
+    }
+
+    @Override
+    public void verifyDone(String slave, int remaining) {
+    }
+
+    public void finalizeComplete() {
+    }
+
     public void goToCorner(int cornerIndex) {
     }
 
     public void onIntervalsReassigned() {
+    }
+
+    public String getHeartbeatData() {
+        return null;
     }
 
     public boolean isFinalizePhase() {

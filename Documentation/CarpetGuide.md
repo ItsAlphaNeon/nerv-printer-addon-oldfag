@@ -80,5 +80,7 @@ One bot acts as the **master** and works alongside the other **slaves**, coordin
 3. Enable the module on every bot. The master starts a WebSocket server on activation; slaves stay in slave mode until invited.
 4. Complete the station setup **on the master only** (or load a config).
 5. Move all bots into render distance of each other, then press **Invite players in range** on the master. The master sends each nearby bot a one-time DM containing its IP and port; slaves automatically connect to the WebSocket server, register themselves and confirm back (`Slave <name> joined the hivemind via invite.`). The setup is broadcast to them automatically.
+   - The master prints which IP + network interface it advertises right after inviting (`Advertised IP: x.x.x.x (interface: ...)`), and the same info shows under **Hivemind Status**.
+   - If slaves cannot connect: auto-detection picked a virtual adapter (VirtualBox/Hyper-V/WSL/VPN - their IPs are unreachable from other PCs). Set the **advertised-ip** setting on the master to its real LAN IP (e.g. `192.168.1.50`) and re-invite.
    - Only needed if DMs are blocked on your server: manually set *master-address* to the master's IP on each slave bot (e.g. `127.0.0.1` on the same PC, otherwise the master's LAN IP) and use the same *master-port*.
 6. Start the print in the usual way (`.startprinter`). The master transmits the map, splits the rows and starts everyone.

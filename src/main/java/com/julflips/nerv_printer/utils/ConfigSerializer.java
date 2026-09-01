@@ -33,8 +33,24 @@ public final class ConfigSerializer {
         HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
         ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners
     ) {
+        return toJsonString(type, reset, cartographyTable, finishedMapChest, mapMaterialChests,
+            dumpStation, mapCorner, materialDict, perimeterCorners, null);
+    }
+
+    public static String toJsonString(
+        String type,
+        Pair<BlockPos, Vec3d> reset,
+        Pair<BlockPos, Vec3d> cartographyTable,
+        Pair<BlockPos, Vec3d> finishedMapChest,
+        ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests,
+        Pair<Vec3d, Pair<Float, Float>> dumpStation,
+        BlockPos mapCorner,
+        HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
+        ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners,
+        Pair<BlockPos, Vec3d> afkSpot
+    ) {
         JsonObject root = buildRoot(type, reset, cartographyTable, finishedMapChest, null, null,
-            mapMaterialChests, dumpStation, mapCorner, materialDict, null, perimeterCorners);
+            mapMaterialChests, dumpStation, mapCorner, materialDict, null, perimeterCorners, afkSpot);
         Gson gson = new GsonBuilder().create();
         return gson.toJson(root);
     }
@@ -90,7 +106,24 @@ public final class ConfigSerializer {
         ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners
     ) throws IOException {
         writeToJson(file, type, reset, cartographyTable, finishedMapChest, null, null,
-            mapMaterialChests, dumpStation, mapCorner, materialDict, null, perimeterCorners);
+            mapMaterialChests, dumpStation, mapCorner, materialDict, null, perimeterCorners, null);
+    }
+
+    public static void writeToJson(
+        Path file,
+        String type,
+        Pair<BlockPos, Vec3d> reset,
+        Pair<BlockPos, Vec3d> cartographyTable,
+        Pair<BlockPos, Vec3d> finishedMapChest,
+        ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests,
+        Pair<Vec3d, Pair<Float, Float>> dumpStation,
+        BlockPos mapCorner,
+        HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
+        ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners,
+        Pair<BlockPos, Vec3d> afkSpot
+    ) throws IOException {
+        writeToJson(file, type, reset, cartographyTable, finishedMapChest, null, null,
+            mapMaterialChests, dumpStation, mapCorner, materialDict, null, perimeterCorners, afkSpot);
     }
 
     public static void writeToJson(
@@ -125,8 +158,28 @@ public final class ConfigSerializer {
         Set<ItemStack> toolSet,
         ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners
     ) throws IOException {
+        writeToJson(file, type, reset, cartographyTable, finishedMapChest, usedToolChest, bed,
+            mapMaterialChests, dumpStation, mapCorner, materialDict, toolSet, perimeterCorners, null);
+    }
+
+    public static void writeToJson(
+        Path file,
+        String type,
+        Pair<BlockPos, Vec3d> reset,
+        Pair<BlockPos, Vec3d> cartographyTable,
+        Pair<BlockPos, Vec3d> finishedMapChest,
+        Pair<BlockPos, Vec3d> usedToolChest,
+        Pair<BlockPos, Vec3d> bed,
+        ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests,
+        Pair<Vec3d, Pair<Float, Float>> dumpStation,
+        BlockPos mapCorner,
+        HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
+        Set<ItemStack> toolSet,
+        ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners,
+        Pair<BlockPos, Vec3d> afkSpot
+    ) throws IOException {
         JsonObject root = buildRoot(type, reset, cartographyTable, finishedMapChest, usedToolChest, bed,
-            mapMaterialChests, dumpStation, mapCorner, materialDict, toolSet, perimeterCorners);
+            mapMaterialChests, dumpStation, mapCorner, materialDict, toolSet, perimeterCorners, afkSpot);
         Gson gson = new GsonBuilder().setPrettyPrinting().create();
         try (Writer writer = Files.newBufferedWriter(file)) {
             gson.toJson(root, writer);
@@ -145,7 +198,8 @@ public final class ConfigSerializer {
         BlockPos mapCorner,
         HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
         Set<ItemStack> toolSet,
-        ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners
+        ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners,
+        Pair<BlockPos, Vec3d> afkSpot
     ) {
         JsonObject root = new JsonObject();
 
@@ -206,6 +260,8 @@ public final class ConfigSerializer {
             }
             root.add("perimeterCorners", cornersArray);
         }
+
+        if (afkSpot != null) root.add("afkSpot", blockPosVecPairToJson(afkSpot));
 
         return root;
     }

@@ -60,6 +60,7 @@ public final class ConfigDeserializer {
         public HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict;
         public Set<ItemStack> toolSet;
         public ArrayList<Pair<BlockPos, Vec3d>> perimeterCorners;
+        public Pair<BlockPos, Vec3d> afkSpot;
     }
 
     private static JsonObject getObj(JsonObject root, String key) {
@@ -157,6 +158,10 @@ public final class ConfigDeserializer {
                     );
                 }
             }
+
+            // Optional (older configs don't have it)
+            obj = getObj(root, "afkSpot");
+            data.afkSpot = obj != null ? jsonToBlockPosVecPair(obj) : null;
 
             return data;
     }

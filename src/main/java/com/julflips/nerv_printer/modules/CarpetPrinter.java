@@ -148,6 +148,13 @@ public class CarpetPrinter extends Module implements MapPrinter {
         .build()
     );
 
+    public final Setting<Boolean> afkAnchor = sgGeneral.add(new BoolSetting.Builder()
+        .name("afk-anchor")
+        .description("Hivemind: when the master finishes its rows it stands at the AFK Spot to keep the carpet dupers loaded, and delegates finalize/wipe to a slave. Disable for raw speed (no duper anchoring).")
+        .defaultValue(true)
+        .build()
+    );
+
     private final Setting<Boolean> customFolderPath = sgGeneral.add(new BoolSetting.Builder()
         .name("custom-folder-path")
         .description("Allows to set a custom path to the nbt folder.")
@@ -324,6 +331,16 @@ public class CarpetPrinter extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<String> advertisedIp = sgMultiUser.add(new StringSetting.Builder()
+        .name("advertised-ip")
+        .description("Master only: the IP sent to slaves in invites. Empty = auto-detect. Set this if slaves"
+            + " cannot connect - auto-detection can pick a virtual adapter (VirtualBox/Hyper-V/WSL/VPN)"
+            + " whose IP other PCs cannot reach. Use this PC's real LAN IP (e.g. 192.168.1.50).")
+        .defaultValue("")
+        .onChanged((value) -> SlaveSystem.advertisedIpOverride = value)
+        .build()
+    );
+
     // Chat transport used ONLY for the bootstrap invite (hivemind:<ip>:<port>)
 
     private final Setting<String> directMessageCommand = sgMultiUser.add(new StringSetting.Builder()
@@ -444,6 +461,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
     Pair<BlockPos, Vec3d> resetButton;
     Pair<BlockPos, Vec3d> cartographyTable;
     Pair<BlockPos, Vec3d> finishedMapChest;
+    Pair<BlockPos, Vec3d> afkSpot;                               //Chunk anchor / duper parking spot
     ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests;
     Pair<Vec3d, Pair<Float, Float>> dumpStation;                    //Pos, Yaw, Pitch
     BlockPos mapCorner;
@@ -497,6 +515,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
         miningPos = null;
         cartographyTable = null;
         finishedMapChest = null;
+        afkSpot = null;
+        finalizeDelegate = null;
+        finalizeWatchdogTicks = 0;
+        finalizingForMaster = false;
         mapMaterialChests = new ArrayList<>();
         dumpStation = null;
         lastSwappedMaterial = null;
@@ -521,6 +543,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
         setInterval(new Pair<>(0, 127));
         // Initialize Slave System settings
+        SlaveSystem.advertisedIpOverride = advertisedIp.get();
         SlaveSystem.setupSlaveSystem(this, masterPort.get(), masterAddress.get(),
             directMessageCommand.get(), senderPrefix.get(), senderSuffix.get());
 
@@ -558,6 +581,19 @@ public class CarpetPrinter extends Module implements MapPrinter {
     @Override
     public void onDeactivate() {
         Utils.setForwardPressed(false);
+        // Notify the hive so nobody waits for a bot that silently vanished:
+        // a deactivated slave is unregistered + re-split; a deactivated master
+        // pauses its slaves instead of leaving them building into the void.
+        if (SlaveSystem.isHiveActive()) {
+            if (SlaveSystem.isMasterMode()) {
+                if (!SlaveSystem.slaves.isEmpty()) {
+                    SlaveSystem.sendToAllSlaves("pause");
+                    HiveLog.log("MASTER deactivated - all slaves paused");
+                }
+            } else if (SlaveSystem.isSlave()) {
+                SlaveSystem.queueMasterDM("leaving");
+            }
+        }
     }
 
     @EventHandler
@@ -632,9 +668,15 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 blockPos = packet.getBlockHitResult().getBlockPos();
                 if (MapAreaCache.getCachedBlockState(blockPos).getBlock() instanceof AbstractChestBlock) {
                     finishedMapChest = new Pair<>(blockPos, mc.player.getEntityPos());
-                    info("Finished Map Chest selected. Select all §aMap- and Material-Chests. Type §a.startprinter §7to start printing.");
-                    state = State.SelectingChests;
+                    info("Finished Map Chest selected. Select the §aAFK Spot §7(near the carpet dupers - the master will stand here while slaves build).");
+                    state = State.SelectingAfkSpot;
                 }
+                break;
+            case SelectingAfkSpot:
+                blockPos = packet.getBlockHitResult().getBlockPos();
+                afkSpot = new Pair<>(blockPos, mc.player.getEntityPos());
+                info("AFK Spot selected. Select all §aMap- and Material-Chests. Type §a.startprinter §7to start printing.");
+                state = State.SelectingChests;
                 break;
             case SelectingChests:
                 blockPos = packet.getBlockHitResult().getBlockPos();
@@ -837,6 +879,41 @@ public class CarpetPrinter extends Module implements MapPrinter {
                         break;
                     }
                 }
+                // WIPE-COMPLETENESS GATE: never erase a canvas that isn't fully built.
+                // Detects AIR GAPS, WRONG blocks and non-fluid leftovers - the old
+                // scan only caught air gaps, so wrong colors silently ruined the
+                // crafted map item. Applies to the master's own finalize AND the
+                // delegated one - the last line of defense against wiping a bad map.
+                ArrayList<BlockPos> issueBlocks = listBuildIssuesFullArea(25);
+                if (!issueBlocks.isEmpty()) {
+                    finalizeWipeBlockAttempts++;
+                    warning("§cWIPE BLOCKED§7 - map incomplete: " + issueBlocks.size()
+                        + "+ issue block(s). Repair round " + finalizeWipeBlockAttempts + "/3...");
+                    HiveLog.log("WIPE BLOCKED (round " + finalizeWipeBlockAttempts + "): " + issueBlocks.size()
+                        + "+ issue blocks, first: " + issueBlocks.get(0).toShortString());
+                    if (finalizeWipeBlockAttempts >= 3) {
+                        HiveLog.log("WIPE BLOCKED 3x - HOLDING. Map cannot be completed automatically;"
+                            + " the wipe will NOT run until the issues are fixed manually.");
+                        warning("Map still incomplete after 3 repair rounds - holding here. The map will NOT be wiped."
+                            + " Fix the issues manually, then re-enable the module.");
+                        return;
+                    }
+                    // Repair round: break wrong/leftover blocks (placement re-places
+                    // them), walk to air gaps so the placement loop fills them, then a
+                    // lineEnd re-scan so the next gate check sees the result.
+                    for (BlockPos p : issueBlocks) {
+                        BlockPos rel = p.subtract(mapCorner);
+                        BlockState current = MapAreaCache.getVerifiedBlockState(p);
+                        boolean needsBreak = map[rel.getX()][rel.getZ()] == null
+                            || (current != null && !current.isAir());
+                        checkpoints.add(new Pair(p.toCenterPos(),
+                            new Pair<>(needsBreak ? "break" : "", needsBreak ? p : null)));
+                    }
+                    checkpoints.add(new Pair(issueBlocks.get(0).toCenterPos(), new Pair("lineEnd", null)));
+                    state = State.Walking;
+                    break;
+                }
+                finalizeWipeBlockAttempts = 0;
                 if (breakCarpetAboveReset.get()) {
                     BlockPos abovePos = resetButton.getLeft().up();
                     if (MapAreaCache.getCachedBlockState(abovePos).getBlock() instanceof CarpetBlock) {
@@ -894,9 +971,9 @@ public class CarpetPrinter extends Module implements MapPrinter {
         }
 
         // Work-balance sweep (master, while building): refresh own progress,
-        // log a PROGRESS line every 30s, and let an idle master steal work.
+        // log a PROGRESS line every 30s, and either anchor the dupers or steal work.
         if (!SlaveSystem.isSlave() && !finalizePhase && map != null
-            && (state == State.Walking || state == State.Dumping || state == State.AwaitMasterAllBuilt)) {
+            && (state == State.Walking || state == State.Dumping || state == State.AwaitMasterAllBuilt || state == State.Afk)) {
             if (++progressSweepTicks >= 600) {
                 progressSweepTicks = 0;
                 ownUnfinished = countUnfinishedRowsInInterval(workingInterval);
@@ -905,13 +982,114 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     progress.append(", ").append(slave).append(": ").append(slaveRemaining(slave)).append(" (est)");
                 }
                 HiveLog.log(progress.toString());
-                if (ownUnfinished == 0) {
-                    // Master is done but slaves still have substantial work - take over the tail
-                    stealWork("master");
+                // STALL WATCHDOG: a slave whose unfinished count hasn't moved in
+                // 5 minutes (10 sweeps) is wedged. Re-partition the rows among the
+                // slaves (max twice per map - a genuinely unfixable block would
+                // otherwise cause repartition loops); after that, just scream.
+                for (String slave : SlaveSystem.slaves) {
+                    int rem = slaveRemaining(slave);
+                    if (rem <= 0) {
+                        stallUnfinished.remove(slave);
+                        stallSweeps.remove(slave);
+                        continue;
+                    }
+                    Integer prev = stallUnfinished.get(slave);
+                    int ticks = (prev != null && prev == rem) ? stallSweeps.getOrDefault(slave, 0) + 1 : 0;
+                    stallUnfinished.put(slave, rem);
+                    stallSweeps.put(slave, ticks);
+                    if (ticks == 10) {
+                        if (stallRepartitionsThisMap < 2 && !finalizePhase) {
+                            stallRepartitionsThisMap++;
+                            HiveLog.log("STALL " + slave + ": " + rem + " unfinished rows unchanged for 5 min"
+                                + " - re-partitioning rows among slaves (attempt " + stallRepartitionsThisMap + "/2)");
+                            warning(slave + " has been stuck on " + rem + " rows for 5 minutes - re-partitioning work.");
+                            // Exclude the wedged bot from the partition: giving it
+                            // fresh rows would just burn the next attempt too.
+                            SlaveSystem.repartitionAmongSlaves(slave);
+                            stallUnfinished.clear();
+                            stallSweeps.clear();
+                        } else {
+                            HiveLog.log("STALL " + slave + ": " + rem + " unfinished rows unchanged for 5 min"
+                                + " - re-partition limit reached; MANUAL INTERVENTION LIKELY REQUIRED");
+                            warning("§c" + slave + " is still stuck on " + rem + " rows. The hivemind cannot finish this map automatically - please check the bot.");
+                        }
+                    }
                 }
+                // A row with a permanently failing placement blocks the countdown
+                // forever. Only treat the master as done when EVERY unfinished row
+                // contains a known error (not merely "some error somewhere").
+                boolean onlyErrorRows = ownUnfinished > 0
+                    && errorRowsInInterval(workingInterval) >= ownUnfinished;
+                if (ownUnfinished == 0 || onlyErrorRows) {
+                    if (useAfkAnchor()) {
+                        if (!SlaveSystem.allSlavesFinished()) {
+                            // Hand any leftover rows (incl. stuck error rows) to the slaves
+                            if (ownUnfinished > 0) handOffMasterRows();
+                            // Slaves still building - master anchors the dupers
+                            goAfk();
+                        } else if (finalizeDelegate == null && state != State.Afk) {
+                            // Everyone done - delegate the finalize and stay anchored
+                            delegateFinalize(null);
+                            goAfk();
+                        }
+                    } else {
+                        stealWork("master");
+                    }
+                }
+            }
+            // Finalize watchdog: a delegated slave that never reports completion
+            // gets swapped for another one after 3 minutes (bounded); once the
+            // re-delegation cap is burned - or no other slave exists - the
+            // master runs the finalize itself instead of waiting in Afk forever.
+            if (finalizeDelegate != null) {
+                if (++finalizeWatchdogTicks >= 3600) {
+                    finalizeWatchdogTicks = 0;
+                    finalizeRedelegations++;
+                    String other = null;
+                    for (String s : SlaveSystem.slaves) {
+                        if (!s.equals(finalizeDelegate)) { other = s; break; }
+                    }
+                    if (other != null && finalizeRedelegations < 2) {
+                        HiveLog.log("FINALIZE TIMEOUT - delegate " + finalizeDelegate
+                            + " did not finish; re-delegating to " + other);
+                        warning("Delegate " + finalizeDelegate + " did not finish the finalize - re-delegating to " + other + ".");
+                        SlaveSystem.queueDM(finalizeDelegate, "pause");
+                        delegateFinalize(other);
+                    } else {
+                        HiveLog.log("FINALIZE TIMEOUT - no alternative delegate" + (finalizeRedelegations >= 2 ? " (re-delegate cap reached)" : "")
+                            + " - master runs the finalize itself");
+                        warning("Delegate " + finalizeDelegate + " did not finish - the master is taking over the finalize.");
+                        SlaveSystem.queueDM(finalizeDelegate, "pause");
+                        finalizeDelegate = null;
+                        proceedMasterSelfFinalize();
+                    }
+                }
+            } else {
+                finalizeWatchdogTicks = 0;
             }
         } else {
             progressSweepTicks = 0;
+        }
+
+        // VERIFY watchdog: the assigned verifier must report verifyDone. A
+        // wedged/disconnected verifier gets replaced (capped); after the cap
+        // the flow continues without verification (the wipe gate remains).
+        if (awaitingVerify && ++verifyWatchdogTicks >= VERIFY_WATCHDOG_TICKS) {
+            verifyWatchdogTicks = 0;
+            if (verifyAttempts < MAX_VERIFY_ATTEMPTS && !SlaveSystem.slaves.isEmpty()) {
+                String failed = verifySlave;
+                HiveLog.log("VERIFY timeout - " + failed + " did not report verifyDone; re-assigning");
+                warning("Verifier " + failed + " did not finish in time - assigning another slave.");
+                if (failed != null) SlaveSystem.queueDM(failed, "pause");
+                verifySlave = null;
+                assignVerify(null);
+            } else {
+                HiveLog.log("VERIFY cap reached without verifyDone - continuing to finalize (wipe gate active)");
+                awaitingVerify = false;
+                verifyComplete = true;
+                verifySlave = null;
+                proceedToFinalize(null);
+            }
         }
 
         if (!state.equals(debugPreviousState)) {
@@ -935,6 +1113,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 state = State.Walking;
             } else if (SlaveSystem.allSlavesFinished()) {
                 if (!endBuilding()) return;
+                if (state != State.Walking) return; // AwaitVerify - stop ticking the build path
             } else {
                 return;
             }
@@ -984,7 +1163,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
         }
 
         if (timeoutTicks > 0) {
-            if (mc.player.isOnGround()) timeoutTicks--;
+            // Dumping must never be frozen by an onGround quirk - always tick down there
+            if (mc.player.isOnGround() || state == State.Dumping) timeoutTicks--;
             Utils.setForwardPressed(false);
             return;
         }
@@ -1040,13 +1220,86 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (state == State.Dumping) {
             int dumpSlot = getDumpSlot();
             if (dumpSlot == -1) {
+                dumpStartMillis = 0;
+                dumpForcedThrows = 0;
+                dumpInvResyncDone = false;
                 HashMap<Item, Integer> requiredItems = getRequiredItems();
                 Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInformation = Utils.getInvInformation(requiredItems, availableSlots);
                 refillInventory(invInformation.getRight());
                 state = State.Walking;
             } else {
+                ItemStack stack = mc.player.getInventory().getStack(dumpSlot);
+                // Progress detection: a different slot or a shrinking stack means
+                // drops ARE going through - reset the watchdog timer.
+                if (dumpSlot != lastDumpSlot || stack.getCount() < lastDumpCount) {
+                    dumpStartMillis = 0;
+                    dumpForcedThrows = 0;
+                    dumpInvResyncDone = false; // drops go through again - re-arm the resync
+                }
+                lastDumpSlot = dumpSlot;
+                lastDumpCount = stack.getCount();
+                long now = System.currentTimeMillis();
+                if (dumpStartMillis == 0) dumpStartMillis = now;
+                long stallMillis = now - dumpStartMillis;
+
+                if (stallMillis >= 20000) {
+                    // Give up: excess items are not worth hanging at the dumper for.
+                    warning("Dump still failing after 20s - skipping the rest and continuing.");
+                    HiveLog.log("DUMP GAVE UP after 20s (slot " + dumpSlot + ": " + stack.getCount()
+                        + "x " + stack.getName().getString() + ") - continuing with excess items");
+                    dumpStartMillis = 0;
+                    dumpForcedThrows = 0;
+                    dumpInvResyncDone = false;
+                    HashMap<Item, Integer> requiredItems = getRequiredItems();
+                    refillInventory(Utils.getInvInformation(requiredItems, availableSlots).getRight());
+                    state = State.Walking;
+                } else if (stallMillis >= 5000 && !dumpInvResyncDone) {
+                    // FIRST-effort unstick: open and close the inventory once.
+                    // Closing a container makes the server run its close logic,
+                    // which hands a phantom held (cursor) item back to the
+                    // inventory - the most common reason THROW clicks are
+                    // silently ignored. Cheaper than the forced-throw escalation;
+                    // fires only once per stall and re-arms on progress.
+                    dumpInvResyncDone = true;
+                    if (mc.currentScreen != null) mc.player.closeHandledScreen();
+                    mc.setScreen(new net.minecraft.client.gui.screen.ingame.InventoryScreen(mc.player));
+                    mc.player.closeHandledScreen();
+                    warning("Dump stalled - opening and closing the inventory once to resync (first effort)...");
+                    HiveLog.log("DUMP stall " + (stallMillis / 1000) + "s on slot " + dumpSlot
+                        + " (" + stack.getCount() + "x " + stack.getName().getString()
+                        + ") - inventory open/close resync (first effort)");
+                } else if (stallMillis >= 10000 && now - lastForcedThrowMillis >= 2000) {
+                    lastForcedThrowMillis = now;
+                    dumpForcedThrows++;
+                    if (mc.currentScreen != null) mc.player.closeHandledScreen();
+                    int handlerSlot = dumpSlot < 9 ? dumpSlot + 36 : dumpSlot;
+                    if (dumpForcedThrows % 3 == 0) {
+                        // Anticheat desync workaround: the server can believe the
+                        // cursor is still holding an item (phantom held stack), which
+                        // silently rejects all THROW clicks. Parking the cursor into
+                        // an empty player-inventory slot re-syncs the cursor state.
+                        int emptySlot = findEmptyInventoryHandlerSlot();
+                        if (emptySlot != -1) {
+                            warning("Dump still rejected - resetting inventory cursor state (server desync)...");
+                            HiveLog.log("DUMP anticheat desync - parking phantom cursor stack into empty slot "
+                                + emptySlot + " then retrying");
+                            mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, emptySlot, 0, SlotActionType.PICKUP, mc.player);
+                            mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, emptySlot, 0, SlotActionType.PICKUP, mc.player);
+                        }
+                    } else {
+                        warning("Dump not going through (server lag?) - forcing a full-stack throw of §a"
+                            + stack.getName().getString() + "§7 (attempt " + dumpForcedThrows + ")");
+                        HiveLog.log("DUMP stalled " + (stallMillis / 1000) + "s on slot " + dumpSlot + " ("
+                            + stack.getCount() + "x " + stack.getName().getString() + ") - forcing full-stack throw");
+                        mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, handlerSlot, 1, SlotActionType.THROW, mc.player);
+                    }
+                } else if (stallMillis >= 3000 && now - lastDumpLogMillis >= 3000) {
+                    lastDumpLogMillis = now;
+                    HiveLog.log("DUMP slow: " + (stallMillis / 1000) + "s at the dumper (slot " + dumpSlot
+                        + ": " + stack.getCount() + "x " + stack.getName().getString() + ")");
+                }
                 if (debugPrints.get())
-                    info("Dumping §a" + mc.player.getInventory().getStack(dumpSlot).getName().getString() + " (slot " + dumpSlot + ")");
+                    info("Dumping §a" + stack.getName().getString() + " (slot " + dumpSlot + ")");
                 InvUtils.drop().slot(dumpSlot);
                 timeoutTicks = invActionDelay.get();
             }
@@ -1054,6 +1307,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
         // Await map reset
         if (state == State.AwaitAreaClear && MapAreaCache.isMapAreaClear()) {
+            awaitClearTicks = 0;
+            wipeRetryAttempts = 0;
             if (debugWipeOnly) {
                 debugWipeOnly = false;
                 isWiping = false;
@@ -1061,10 +1316,42 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 state = State.SelectingChests;
                 return;
             }
+            if (finalizingForMaster) {
+                // Delegated finalize finished - hand control back to the master
+                finalizingForMaster = false;
+                HiveLog.log("FINALIZE complete - wipe done, reporting to master");
+                info("Delegated finalize complete. Waiting for the next map...");
+                SlaveSystem.queueMasterDM("finalizeDone");
+                state = State.AwaitSlaveNextMap;
+                Utils.setForwardPressed(false);
+                return;
+            }
             state = State.AwaitNBTFile;
             return;
         }
         if (state == State.AwaitAreaClear) {
+            // TIMEOUT: a missed button press ("Continuing anyway...") or stale
+            // unloaded chunks otherwise keep the bot here FOREVER - re-run the
+            // wipe (bounded) and then hold loudly.
+            if (++awaitClearTicks >= 6000) {
+                awaitClearTicks = 0;
+                wipeRetryAttempts++;
+                if (wipeRetryAttempts >= 3) {
+                    HiveLog.log("WIPE HOLD - map area still not clear after " + wipeRetryAttempts
+                        + " attempts; the water state is probably wrong. MANUAL INTERVENTION REQUIRED.");
+                    warning("§cMap area not clearing after 3 wipe attempts - holding here. Check the reset button / water state manually.");
+                    return;
+                }
+                HiveLog.log("WIPE retry " + wipeRetryAttempts + "/3 - map area not clear, re-running the wipe sequence");
+                warning("Map area not clearing - re-running the wipe sequence (attempt " + wipeRetryAttempts + "/3).");
+                checkpoints.clear();
+                if (!triggerWipeSequence()) {
+                    warning("Cannot re-run the wipe sequence (missing reset button/perimeter corners). Holding.");
+                    wipeRetryAttempts = 3;
+                    return;
+                }
+                return;
+            }
             // Throttled log so a stuck wipe is diagnosable
             if (awaitClearLogTicks > 0) {
                 awaitClearLogTicks--;
@@ -1147,8 +1434,41 @@ public class CarpetPrinter extends Module implements MapPrinter {
                                 + ". Should be: " + missingBlockString);
                         }
                     }
+                    // RECONCILE, not append: the scan re-checks every position, so the
+                    // list becomes exactly the set of currently-wrong blocks. Fixed
+                    // positions drop out (the old append-only list kept them forever,
+                    // froze the heartbeat error count and made Repair re-break fixed
+                    // blocks every pass).
+                    knownErrors.clear();
                     knownErrors.addAll(newErrors);
-                    if (!knownErrors.isEmpty() && errorAction.get() == ErrorAction.Reset) {
+                    // Hivemind master, error-row death spiral guard: if EVERY
+                    // unfinished row the master holds contains a known error it
+                    // can never fix them itself (it never self-repairs). Hand the
+                    // rows to the slaves - their interval scans re-detect and
+                    // repair them. Without this the non-anchor master loops on
+                    // error rows forever and the finalize never runs.
+                    if (!finalizePhase && !SlaveSystem.isSlave() && !SlaveSystem.slaves.isEmpty()
+                        && !rowsHandedOff && ownUnfinished > 0
+                        && errorRowsInInterval(workingInterval) >= ownUnfinished) {
+                        HiveLog.log("ERRORS occupy all " + ownUnfinished
+                            + " of my unfinished rows - handing my rows to the slaves for repair");
+                        warning("All my remaining rows contain errors - handing them to the slaves (they re-scan and repair).");
+                        handOffMasterRows();
+                    }
+                    // Hivemind master: never self-repair or wipe mid-map - it would
+                    // abandon its rows/AFK spot and wander into the duper machines.
+                    // Slaves fix errors in their own intervals; the master just retries.
+                    boolean masterInHive = !SlaveSystem.isSlave() && !SlaveSystem.slaves.isEmpty();
+                    if (!knownErrors.isEmpty() && masterInHive && logErrors.get()) {
+                        // Throttle: this fires every line-end; once per 30s is plenty
+                        long now = System.currentTimeMillis();
+                        if (now - lastErrorsLogMs >= 30000) {
+                            lastErrorsLogMs = now;
+                            HiveLog.log("ERRORS " + knownErrors.size()
+                                + " pending on master - error fixing delegated to slaves (master keeps building)");
+                        }
+                    }
+                    if (!knownErrors.isEmpty() && errorAction.get() == ErrorAction.Reset && !masterInHive) {
                         warning("ErrorAction is Reset: Resetting map because of an error...");
                         checkpoints.clear();
                         if (breakCarpetAboveReset.get()) {
@@ -1169,6 +1489,14 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     BlockPos mapMaterialChest = getBestChest(Items.CARTOGRAPHY_TABLE).getLeft();
                     interactWithBlock(mapMaterialChest);
                     state = State.AwaitMapChestResponse;
+                    return;
+                case "parkAfk":
+                    // Master anchored at the duper spot - stand still until finalize completes
+                    checkpoints.clear();
+                    state = State.Afk;
+                    Utils.setForwardPressed(false);
+                    HiveLog.log("AFK master parked at the duper anchor spot");
+                    info("Anchoring the dupers - standing by at the AFK spot.");
                     return;
                 case "fillMap":
                     mc.getNetworkHandler().sendPacket(new PlayerInteractItemC2SPacket(Hand.MAIN_HAND, Utils.getNextInteractID(), mc.player.getYaw(), mc.player.getPitch()));
@@ -1218,6 +1546,13 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     state = State.AwaitSlaveNextMap;
                     Utils.setForwardPressed(false);
                     return;
+                case "verifyPoint":
+                    // Interim verify walk point - keep going, nothing to do here
+                    return;
+                case "verifyScan":
+                    // Reached the last quadrant center - full canvas rescan
+                    handleVerifyScan();
+                    return;
                 case "break":
                     state = State.AwaitBlockBreak;
                     miningPos = checkpointAction.getRight();
@@ -1228,7 +1563,14 @@ public class CarpetPrinter extends Module implements MapPrinter {
             }
             if (checkpoints.isEmpty()) {
                 if (!knownErrors.isEmpty()) {
-                    if (errorAction.get() == ErrorAction.ToggleOff) {
+                    boolean masterInHive = !SlaveSystem.isSlave() && !SlaveSystem.slaves.isEmpty();
+                    if (masterInHive) {
+                        // Hivemind master: never repair/toggle-off - keep building (or
+                        // anchoring). Unfixable rows stay pending; slaves handle theirs.
+                        HiveLog.log("ERRORS " + knownErrors.size()
+                            + " skipped by master (hivemind) - no repair/reset/toggle-off");
+                        knownErrors.clear();
+                    } else if (errorAction.get() == ErrorAction.ToggleOff) {
                         info("Found errors: ");
                         for (int i = knownErrors.size() - 1; i >= 0; i--) {
                             info("Pos: " + knownErrors.get(i).toShortString());
@@ -1240,17 +1582,39 @@ public class CarpetPrinter extends Module implements MapPrinter {
                         toggle();
                         return;
                     } else if (errorAction.get() == ErrorAction.Repair) {
+                        // VERIFY-BEFORE-BREAK: only route to positions that are still
+                        // wrong RIGHT NOW. The old code re-broke every known error on
+                        // every repair pass - including blocks it had already fixed -
+                        // which is the "tearing up corrected blocks" death spiral.
+                        ArrayList<BlockPos> toRepair = new ArrayList<>();
+                        for (BlockPos errorPos : knownErrors) {
+                            BlockPos rel = errorPos.subtract(mapCorner);
+                            boolean stillWrong = true;
+                            if (map != null && rel.getX() >= 0 && rel.getX() < 128 && rel.getZ() >= 0 && rel.getZ() < 128) {
+                                Block expected = map[rel.getX()][rel.getZ()];
+                                BlockState current = MapAreaCache.getVerifiedBlockState(errorPos);
+                                if (current != null) {
+                                    stillWrong = expected == null ? !current.isAir() : !current.getBlock().equals(expected);
+                                }
+                            }
+                            if (stillWrong) toRepair.add(errorPos);
+                        }
+                        if (toRepair.isEmpty()) {
+                            // Everything already fixed (or unverifiable) - re-scan instead
+                            knownErrors.clear();
+                            checkpoints.add(new Pair(mc.player.getEntityPos(), new Pair("lineEnd", null)));
+                            state = State.Walking;
+                            return;
+                        }
                         info("Fixing errors: ");
-                        for (int i = knownErrors.size() - 1; i >= 0; i--) {
-                            BlockPos errorPos = knownErrors.get(i);
+                        for (BlockPos errorPos : toRepair) {
                             info("Pos: " + errorPos.toShortString());
                             checkpoints.add(new Pair(errorPos.toCenterPos(), new Pair("break", errorPos)));
                         }
                         checkpoints.add(new Pair(dumpStation.getLeft(), new Pair("dump", null)));
-                        for (int i = 0; i < knownErrors.size(); i++) {
-                            String action = (i == knownErrors.size() - 1) ? "lineEnd" : "sprint";
-                            BlockPos errorPos = knownErrors.get(i);
-                            checkpoints.add(new Pair(errorPos.toCenterPos(), new Pair(action, null)));
+                        for (int i = 0; i < toRepair.size(); i++) {
+                            String action = (i == toRepair.size() - 1) ? "lineEnd" : "sprint";
+                            checkpoints.add(new Pair(toRepair.get(i).toCenterPos(), new Pair(action, null)));
                         }
                         knownErrors.clear();
                         return;
@@ -1263,7 +1627,16 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     return;
                 }
                 if (SlaveSystem.allSlavesFinished()) {
+                    if (useAfkAnchor()) {
+                        // Master anchors the dupers: delegate the finalize and park
+                        delegateFinalize(null);
+                        goAfk();
+                        return;
+                    }
                     if (!endBuilding()) return;
+                    // Verify pass assigned: state is AwaitVerify with an empty
+                    // checkpoint list - must not fall through to checkpoints.get(0)
+                    if (state != State.Walking) return;
                 } else {
                     info("Waiting for slaves to finish...");
                     state = State.AwaitMasterAllBuilt;
@@ -1298,7 +1671,16 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 if (blockState.isAir() && posDistance <= placeRange.get() && posDistance > minPlaceDistance.get()
                     && MapAreaCache.isWithingMap(blockPos) && map[relativePos.getX()][relativePos.getZ()] != null
                     && blockPos.getX() <= currentGoal.getX() + linesPerRun.get() - 1 && !placements.contains(blockPos)
-                    && blockPos.getX() >= currentGoal.getX() - 1) {
+                    && blockPos.getX() >= currentGoal.getX() - 1
+                    // Strict interval ownership: the old window bled 1 row past the
+                    // interval edge, letting bots place in a neighbour's rows. The
+                    // pre-finalize verify pass and the wipe-gate repair rounds are
+                    // owner-neutral (their checkpoints target exact issue positions).
+                    // NOTE: blockPos is ABSOLUTE - it must be converted to a relative
+                    // row before the interval check (comparing ~3.4M world X against
+                    // rows 0-127 silently rejected EVERY placement).
+                    && (verifyingForMaster || finalizePhase
+                        || Utils.isInInterval(workingInterval, blockPos.getX() - mapCorner.getX()))) {
                     if (closestPos.get() == null || posDistance < PlayerUtils.distanceTo(closestPos.get())) {
                         closestPos.set(new BlockPos(blockPos.getX(), blockPos.getY(), blockPos.getZ()));
                     }
@@ -1410,6 +1792,24 @@ public class CarpetPrinter extends Module implements MapPrinter {
             }
             if (foundItem == null) {
                 warning("Could not find material for chest position : " + lastInteractedBlockPos.toShortString());
+                toggle();
+                return;
+            }
+            // GIVE-UP: every known chest for this material was already visited
+            // and came up empty. The old getBestChest recursion cleared
+            // checkedChests and returned the SAME chest - an infinite
+            // chest<->line ping-pong that stalled the map forever.
+            boolean allChestsChecked = true;
+            for (Pair<BlockPos, Vec3d> p : materialDict.get(foundItem)) {
+                if (!checkedChests.contains(p.getLeft())) {
+                    allChestsChecked = false;
+                    break;
+                }
+            }
+            if (allChestsChecked) {
+                HiveLog.log("RESTOCK HOLD - all chests for " + foundItem.getName().getString() + " are empty");
+                warning("§cAll material chests for " + foundItem.getName().getString()
+                    + " are empty - stopping. Refill them and re-enable the module.");
                 toggle();
                 return;
             }
@@ -1551,12 +1951,129 @@ public class CarpetPrinter extends Module implements MapPrinter {
     private final HashMap<String, Integer> slaveUnfinished = new HashMap<>();
     private int ownUnfinished = -1;
     private int progressSweepTicks = 0;
+    // Stall watchdog: a bot whose unfinished-row count is stuck >0 for minutes is
+    // wedged (repair ping-pong, unreachable block) - escalate instead of waiting forever
+    private final HashMap<String, Integer> stallUnfinished = new HashMap<>();
+    private final HashMap<String, Integer> stallSweeps = new HashMap<>();
+    private int stallRepartitionsThisMap = 0;
     /** Ticks spent in AwaitRestockResponse without any chest data arriving. */
     private int restockStallTicks = 0;
+    // Master AFK / delegated finalize (hivemind duper anchoring)
+    private String finalizeDelegate = null;
+    private int finalizeWatchdogTicks = 0;
+    private boolean finalizingForMaster = false;
+    /** True once the master handed its leftover rows to the slaves this map. */
+    private boolean rowsHandedOff = false;
+    /** Captured at delegation so a re-delegate can't rename the wrong map file. */
+    private String delegatedMapFileName = null;
+    /** Repair rounds attempted when the wipe-completeness gate blocks a wipe. */
+    private int finalizeWipeBlockAttempts = 0;
+    /** Setup broadcast bookkeeping (per-slave, per-payload debounce). */
+    private String lastBroadcastPayload = null;
+    /** Slaves that already received the current setup payload. */
+    private final HashSet<String> slavesWithCurrentSetup = new HashSet<>();
+    /** ERRORS-pending log throttle (was spamming once per line-end). */
+    private long lastErrorsLogMs = 0;
+    // Dump watchdog: track whether items actually leave the inventory at the dumper
+    private long dumpStartMillis = 0;
+    private long lastForcedThrowMillis = 0;
+    private long lastDumpLogMillis = 0;
+    private int dumpForcedThrows = 0;
+    /** True after the open/close-inventory resync fired for the current stall. */
+    private boolean dumpInvResyncDone = false;
+    private int lastDumpSlot = -1;
+    private int lastDumpCount = -1;
     /** Never steal from a bot with fewer unfinished rows than this (avoids endgame thrashing). */
     private static final int MIN_STEAL_ROWS = 8;
     /** Always steal at least this many rows so the taker's trip is worth it. */
     private static final int MIN_STEAL_AMOUNT = 4;
+    /** Max verify (re-)assignments per map before relying on the wipe gate alone. */
+    private static final int MAX_VERIFY_ATTEMPTS = 3;
+    /** Ticks the verify watchdog waits for verifyDone before re-assigning (5 min). */
+    private static final int VERIFY_WATCHDOG_TICKS = 6000;
+    /** Max blocks the verifier repairs per round (bounds the checkpoint path). */
+    private static final int MAX_VERIFY_REPAIRS = 256;
+
+    // Pre-finalize canvas verification (assigned to a slave before finalize)
+    private String verifySlave = null;
+    private boolean awaitingVerify = false;
+    private boolean verifyComplete = false;
+    private int verifyAttempts = 0;
+    private int verifyWatchdogTicks = 0;
+    /** Slave side: true while running the pre-finalize verify pass. */
+    private boolean verifyingForMaster = false;
+    private int verifyRound = 0;
+
+    // AwaitAreaClear watchdog (a missed button press / stale chunk otherwise waits forever)
+    private int awaitClearTicks = 0;
+    private int wipeRetryAttempts = 0;
+    /** Delegated-finalize re-assignments this map (cap -> master runs it itself). */
+    private int finalizeRedelegations = 0;
+
+    /** Counts distinct rows in the interval that hold a known-error position. */
+    private int errorRowsInInterval(Pair<Integer, Integer> interval) {
+        if (mapCorner == null || interval == null) return 0;
+        HashSet<Integer> rows = new HashSet<>();
+        for (BlockPos p : knownErrors) {
+            int row = p.getX() - mapCorner.getX();
+            if (Utils.isInInterval(interval, row)) rows.add(row);
+        }
+        return rows.size();
+    }
+
+    /**
+     * Gives the master's remaining rows away to the slaves (before going AFK).
+     * RE-PARTITIONS the entire row space 0-127 among the slaves (disjoint, no
+     * union-merge - the old merge created overlapping intervals and bots fought
+     * over the same blocks). Fires ONCE per map - the rowsHandedOff flag prevents
+     * the sweep from re-handing off every 30s while the master sits parked.
+     */
+    private void handOffMasterRows() {
+        if (rowsHandedOff || SlaveSystem.slaves.isEmpty()) return;
+        rowsHandedOff = true;
+        // Any FUTURE re-split (slave join/disconnect) must stay slaves-only -
+        // the parked master must never receive rows it cannot build.
+        SlaveSystem.masterRowsHandedOff = true;
+        HiveLog.log("HANDOFF master rows "
+            + (workingInterval != null ? workingInterval.getLeft() + "-" + workingInterval.getRight() : "?")
+            + " - re-partitioning all rows among slaves (disjoint)");
+        info("Handing my rows to the slaves before anchoring.");
+        SlaveSystem.repartitionAmongSlaves();
+        slaveUnfinished.clear();
+        // Empty the master's own interval so its row count reads 0 from now on - a
+        // parked master can never rebuild its stuck rows and the sweep would
+        // otherwise re-fire this handoff every 30s.
+        setInterval(new Pair<>(0, -1));
+        ownUnfinished = 0;
+    }
+
+    /** True when AFK-anchor mode is on and the spot is configured. */
+    @Override
+    public boolean usesAfkAnchorRows() {
+        return !SlaveSystem.isSlave() && afkAnchor.get() && afkSpot != null;
+    }
+
+    @Override
+    public String getHeartbeatData() {
+        String phase;
+        if (state == State.Afk
+            || (state == State.AwaitSlaveContinue && oldState == State.Afk)) phase = "ANCHORING";
+        else if (verifyingForMaster) phase = "VERIFYING";
+        else if (map == null) phase = "NOMAP";
+        else if (finalizePhase) phase = "FINALIZING";
+        else if (!isActive()) phase = "IDLE";
+        else phase = "BUILDING";
+        int start = workingInterval != null ? workingInterval.getLeft() : -1;
+        int end = workingInterval != null ? workingInterval.getRight() : -1;
+        // A bot without a map cannot build anything - report its whole interval
+        // as unfinished (the old "0" made map-less slaves invisible to the
+        // stall watchdog and the master waited for them forever).
+        int unfinished = map == null
+            ? intervalRows(workingInterval)
+            : countUnfinishedRowsInInterval(workingInterval);
+        int errors = knownErrors != null ? knownErrors.size() : 0;
+        return "hb:" + phase + "," + start + "," + end + "," + unfinished + "," + errors;
+    }
 
     /** Block count per map row, for workload-weighted interval splitting. */
     @Override
@@ -1577,14 +2094,16 @@ public class CarpetPrinter extends Module implements MapPrinter {
         slaveUnfinished.put(slave, unfinishedRows);
     }
 
-    /** Number of rows in the interval that still have at least one block to place. */
+    /** Number of rows in the interval that still have at least one block to place. Unknown (unloaded) chunks count as unfinished. */
     private int countUnfinishedRowsInInterval(Pair<Integer, Integer> interval) {
         if (map == null || mapCorner == null || interval == null) return 0;
         int count = 0;
         for (int x = interval.getLeft(); x <= interval.getRight(); x++) {
             for (int z = 0; z < 128; z++) {
                 if (map[x][z] == null) continue;
-                if (MapAreaCache.getCachedBlockState(mapCorner.add(x, 0, z)).isAir()) {
+                BlockState state = MapAreaCache.getVerifiedBlockState(mapCorner.add(x, 0, z));
+                if (state == null || state.isAir()) {
+                    // Unverified (unloaded chunk) counts as unfinished - never as done
                     count++;
                     break;
                 }
@@ -1651,7 +2170,9 @@ public class CarpetPrinter extends Module implements MapPrinter {
         } else {
             SlaveSystem.slaveIntervals.put(giverName, kept);
             slaveUnfinished.remove(giverName); // stale after the interval change
-            SlaveSystem.queueDM(giverName, "interval:" + kept.getLeft() + ":" + kept.getRight());
+            // Sequenced + ACKed so a lost interval command can't leave the giver
+            // building rows it no longer owns (heartbeat drift would fight it)
+            SlaveSystem.sendCommand(giverName, HiveCommand.INTERVAL, kept.getLeft() + ":" + kept.getRight());
         }
 
         if (idleSlave.equals("master")) {
@@ -1661,8 +2182,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
             if (state == State.AwaitMasterAllBuilt) state = State.Walking;
         } else {
             SlaveSystem.slaveIntervals.put(idleSlave, stolen);
-            SlaveSystem.queueDM(idleSlave, "interval:" + stolen.getLeft() + ":" + stolen.getRight());
-            SlaveSystem.queueDM(idleSlave, "start");
+            SlaveSystem.sendCommand(idleSlave, HiveCommand.INTERVAL, stolen.getLeft() + ":" + stolen.getRight());
+            SlaveSystem.sendCommand(idleSlave, HiveCommand.START, null);
             SlaveSystem.finishedSlavesDict.put(idleSlave, false);
             SlaveSystem.activeSlavesDict.put(idleSlave, true);
         }
@@ -1689,8 +2210,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 int adjustedX = x + lineBonus;
                 if (!Utils.isInInterval(workingInterval, adjustedX)) break;
                 for (int z = 0; z < 128; z++) {
-                    BlockState blockState = MapAreaCache.getCachedBlockState(mapCorner.add(adjustedX, 0, z));
-                    if (blockState.isAir() && map[adjustedX][z] != null) {
+                    // VERIFIED lookup: an unloaded/unknown chunk counts as NOT finished -
+                    // the old air-fallback made unbuilt rows look done (phantom "finished")
+                    BlockState blockState = MapAreaCache.getVerifiedBlockState(mapCorner.add(adjustedX, 0, z));
+                    if (blockState != null && blockState.isAir() && map[adjustedX][z] != null) {
                         //If there is a replaceable block and not an ignored block type at the position. Mark the line as not done
                         lineFinished = false;
                         break;
@@ -1722,6 +2245,26 @@ public class CarpetPrinter extends Module implements MapPrinter {
             return;
         }
         finalizePhase = false;
+        rowsHandedOff = false;
+        finalizeDelegate = null;
+        finalizeWipeBlockAttempts = 0;
+        delegatedMapFileName = null;
+        stallRepartitionsThisMap = 0;
+        stallUnfinished.clear();
+        stallSweeps.clear();
+        // Pre-finalize verify pass state resets per map
+        verifySlave = null;
+        awaitingVerify = false;
+        verifyComplete = false;
+        verifyAttempts = 0;
+        verifyWatchdogTicks = 0;
+        verifyingForMaster = false;
+        verifyRound = 0;
+        finalizeRedelegations = 0;
+        awaitClearTicks = 0;
+        wipeRetryAttempts = 0;
+        // The master owns rows again - interval re-splits include it once more
+        SlaveSystem.masterRowsHandedOff = false;
         HiveLog.log("MAP START " + (mapFile != null ? mapFile.getName() : "<none>")
             + " (slaves: " + SlaveSystem.slaves.size() + ", finalize phase off)");
         if (!SlaveSystem.isSlave()) {
@@ -1734,7 +2277,31 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (availableSlots.isEmpty()) setupSlots();
         MapAreaCache.reset(mapCorner);
         isWiping = false;
+        // DIRTY-CANVAS SCAN: leftover blocks from a previous/incomplete wipe sit at
+        // positions where this map expects NOTHING. The build loop can never remove
+        // them (it only places at air cells where the map expects a block), so they
+        // used to surface as a giant error storm mid-map (379 phantom errors) and
+        // trigger the repair teardown loop. Break them up front instead.
+        ArrayList<BlockPos> leftovers = new ArrayList<>();
+        for (int x = workingInterval.getLeft(); x <= workingInterval.getRight() && x < 128; x++) {
+            if (!Utils.isInInterval(workingInterval, x)) continue;
+            for (int z = 0; z < 128; z++) {
+                if (map[x][z] != null) continue;
+                BlockState current = MapAreaCache.getVerifiedBlockState(mapCorner.add(x, 0, z));
+                if (current != null && !current.isAir() && current.getFluidState().isEmpty()) leftovers.add(mapCorner.add(x, 0, z));
+            }
+        }
         calculateBuildingPath(startNorthToSouth.get(), true);
+        if (!leftovers.isEmpty()) {
+            int cap = Math.min(leftovers.size(), 512);
+            HiveLog.log("CANVAS DIRTY: " + leftovers.size() + " leftover block(s) in my rows"
+                + (leftovers.size() > cap ? " (breaking first " + cap + ")" : "") + " - e.g. " + leftovers.get(0).toShortString());
+            warning("Canvas has §a" + leftovers.size() + "§7 leftover block(s) in my rows - clearing them first.");
+            for (int i = 0; i < cap; i++) {
+                checkpoints.add(0, new Pair(leftovers.get(i).toCenterPos(), new Pair("break", leftovers.get(i))));
+            }
+            checkpoints.add(0, new Pair(leftovers.get(0).toCenterPos(), new Pair("lineEnd", null)));
+        }
         // Slaves keep their leftover materials (no dump trip) so they can be
         // re-assigned instantly; they restock on demand instead.
         if (!SlaveSystem.isSlave()) checkpoints.add(0, new Pair(dumpStation.getLeft(), new Pair("dump", null)));
@@ -1750,11 +2317,164 @@ public class CarpetPrinter extends Module implements MapPrinter {
         state = State.Walking;
         knownErrors.clear();
         SlaveSystem.setAllSlavesUnfinished();
+        // Pre-finalize verify: a slave walks the quadrant centers (loads every
+        // chunk) and rescans the whole canvas BEFORE any finalize assignment.
+        // This catches wrong blocks and air gaps in ANY bot's rows - the old
+        // flow only detected air gaps at the wipe gate (wrong colors silently
+        // ruined the crafted map item).
+        if (!SlaveSystem.isSlave() && !SlaveSystem.slaves.isEmpty()
+            && !verifyComplete && verifyAttempts < MAX_VERIFY_ATTEMPTS) {
+            assignVerify(null);
+            state = State.AwaitVerify;
+            return true;
+        }
+        if (!SlaveSystem.slaves.isEmpty() && !verifyComplete) {
+            HiveLog.log("VERIFY skipped - attempt cap reached, relying on the wipe gate");
+            verifyComplete = true;
+        }
+        proceedMasterSelfFinalize();
+        return true;
+    }
+
+    /**
+     * The master runs the finalize itself (dump, cartography, finished-map chest).
+     * Used in non-anchor mode and as the fallback when no delegate is available.
+     */
+    private void proceedMasterSelfFinalize() {
         Pair<BlockPos, Vec3d> bestChest = getBestChest(Items.CARTOGRAPHY_TABLE);
-        if (bestChest == null) return false;
+        if (bestChest == null) {
+            // HOLD loudly instead of looping: the old code returned into the
+            // build loop, which re-ran endBuilding every tick forever.
+            HiveLog.log("FINALIZE HOLD - no cartography table found; cannot finalize");
+            warning("§cCannot finalize: no cartography table found in the material chests. Stopping - fix the setup and re-enable the module.");
+            toggle();
+            return;
+        }
+        checkpoints.clear();
         checkpoints.add(new Pair(dumpStation.getLeft(), new Pair("dump", null)));
         checkpoints.add(new Pair(bestChest.getRight(), new Pair("mapMaterialChest", bestChest.getLeft())));
+        renameMapFile();
+        state = State.Walking;
+    }
+
+    /** Picks a slave with a fresh heartbeat for the verify assignment (never the previous verifier). */
+    private String pickHealthySlave() {
+        for (String s : SlaveSystem.slaves) {
+            if (!s.equals(verifySlave) && SlaveSystem.hasFreshHeartbeat(s)) return s;
+        }
+        for (String s : SlaveSystem.slaves) {
+            if (!s.equals(verifySlave)) return s;
+        }
+        return null;
+    }
+
+    /**
+     * Assigns a slave to verify the canvas before the finalize runs. The slave
+     * walks the four quadrant centers (loading every chunk), scans every cell
+     * against the map and repairs what it can, then reports verifyDone:&lt;n&gt;.
+     */
+    private void assignVerify(String preferred) {
+        String slave = preferred != null && SlaveSystem.slaves.contains(preferred)
+            && !preferred.equals(verifySlave) ? preferred : pickHealthySlave();
+        if (slave == null) {
+            // No slave can verify - fall back to the wipe gate as the only guard
+            HiveLog.log("VERIFY skipped - no available slave; relying on the wipe gate");
+            verifyComplete = true;
+            return;
+        }
+        verifySlave = slave;
+        awaitingVerify = true;
+        verifyWatchdogTicks = 0;
+        verifyAttempts++;
+        SlaveSystem.sendCommand(slave, HiveCommand.VERIFY, null);
+        HiveLog.log("VERIFY assigned to " + slave + " (attempt " + verifyAttempts + "/" + MAX_VERIFY_ATTEMPTS + ")");
+        info("Assigning §a" + slave + "§7 to verify the canvas before finalize...");
+    }
+
+    /** Master-side: the verify pass finished; continue with the finalize flow. */
+    @Override
+    public void verifyDone(String slave, int remaining) {
+        if (!SlaveSystem.isSlave() && slave != null && slave.equals(verifySlave)) {
+            awaitingVerify = false;
+            verifyComplete = true;
+            verifySlave = null;
+            if (remaining > 0) {
+                warning("Canvas verification finished with §c" + remaining + "§7 unresolved issue(s) - the wipe gate will hold if they matter.");
+            } else {
+                info("Canvas verified clean by §a" + slave + "§7.");
+            }
+            proceedToFinalize(slave);
+        }
+    }
+
+    /** Continues the finalize flow after verification: delegate or self-finalize. */
+    private void proceedToFinalize(String verifier) {
+        if (useAfkAnchor()) {
+            delegateFinalize(verifier);
+            if (state == State.AwaitVerify) goAfk();
+        } else {
+            proceedMasterSelfFinalize();
+        }
+    }
+
+    /** Slave-side: verify the whole canvas (4 quadrant center walks + full rescan + repair rounds). */
+    @Override
+    public void runVerify() {
+        if (!SlaveSystem.isSlave() || map == null || mapCorner == null) return;
+        verifyingForMaster = true;
+        finalizePhase = true;
+        verifyRound = 0;
+        checkpoints.clear();
+        addVerifyPathCheckpoints();
+        state = State.Walking;
+        HiveLog.log("VERIFY accepted - walking quadrant centers then rescanning");
+        info("Verifying the canvas for the master...");
+    }
+
+    /** Appends the four quadrant-center walk points (loads every chunk) ending in a full rescan. */
+    private void addVerifyPathCheckpoints() {
+        checkpoints.add(new Pair<>(mapCorner.add(32, 0, 32).toCenterPos(), new Pair<>("verifyPoint", null)));
+        checkpoints.add(new Pair<>(mapCorner.add(96, 0, 32).toCenterPos(), new Pair<>("verifyPoint", null)));
+        checkpoints.add(new Pair<>(mapCorner.add(32, 0, 96).toCenterPos(), new Pair<>("verifyPoint", null)));
+        checkpoints.add(new Pair<>(mapCorner.add(96, 0, 96).toCenterPos(), new Pair<>("verifyScan", null)));
+    }
+
+    /**
+     * Full-canvas scan: missing (air at expected block), wrong (block identity
+     * mismatch) and leftover (non-air at null cell, fluids skipped) positions.
+     * Unknown (unloaded) chunks count as missing - never as OK.
+     */
+    private ArrayList<BlockPos> listBuildIssuesFullArea(int limit) {
+        ArrayList<BlockPos> issues = new ArrayList<>();
+        if (map == null || mapCorner == null) return issues;
+        for (int x = 0; x < 128 && (limit <= 0 || issues.size() < limit); x++) {
+            for (int z = 0; z < 128 && (limit <= 0 || issues.size() < limit); z++) {
+                BlockPos pos = mapCorner.add(x, 0, z);
+                BlockState current = MapAreaCache.getVerifiedBlockState(pos);
+                if (map[x][z] == null) {
+                    if (current != null && !current.isAir() && current.getFluidState().isEmpty()) issues.add(pos);
+                } else if (current == null || current.isAir()) {
+                    issues.add(pos);
+                } else if (!current.getBlock().equals(map[x][z]) && current.getFluidState().isEmpty()) {
+                    issues.add(pos);
+                }
+            }
+        }
+        return issues;
+    }
+
+    /** Moves the finished map NBT to the _finished_maps folder (master-side bookkeeping). */
+    private void renameMapFile() {
         try {
+            if (mapFile == null) return;
+            // Guard: only rename the map that was actually finalized (a re-delegate
+            // or map change between delegation and completion must not rename the
+            // wrong file)
+            if (delegatedMapFileName != null && !delegatedMapFileName.equals(mapFile.getName())) {
+                warning("Skipping finished-map rename: current file " + mapFile.getName()
+                    + " does not match the delegated map " + delegatedMapFileName + ".");
+                return;
+            }
             if (moveToFinishedFolder.get()) {
                 File finishedFile = new File(mapFile.getParentFile().getAbsolutePath() + File.separator + "_finished_maps" + File.separator + mapFile.getName());
                 if (mapFile.renameTo(finishedFile)) {
@@ -1767,7 +2487,162 @@ public class CarpetPrinter extends Module implements MapPrinter {
             warning("Failed to move map file " + mapFile.getName() + " to finished map folder");
             e.printStackTrace();
         }
-        return true;
+    }
+
+    /** Slave-side: reached the last quadrant center - scan, repair, repeat (max 3 rounds). */
+    private void handleVerifyScan() {
+        ArrayList<BlockPos> issues = listBuildIssuesFullArea(MAX_VERIFY_REPAIRS);
+        if (issues.isEmpty()) {
+            HiveLog.log("VERIFY scan clean (round " + verifyRound + ")");
+            reportVerifyDone(0);
+            return;
+        }
+        verifyRound++;
+        if (verifyRound > 3) {
+            HiveLog.log("VERIFY gave up after 3 repair rounds - " + issues.size() + "+ issue(s) remain");
+            reportVerifyDone(issues.size());
+            return;
+        }
+        HiveLog.log("VERIFY round " + verifyRound + ": repairing " + issues.size() + " issue(s)");
+        warning("Canvas verification round §a" + verifyRound + "§7: " + issues.size() + " issue(s) to fix...");
+        checkpoints.clear();
+        for (BlockPos p : issues) {
+            BlockPos rel = p.subtract(mapCorner);
+            BlockState current = MapAreaCache.getVerifiedBlockState(p);
+            boolean needsBreak = map[rel.getX()][rel.getZ()] == null
+                || (current != null && !current.isAir());
+            // Break wrong/leftover blocks; for air gaps just walk there - the
+            // placement loop re-places them (restock happens via the slave branch).
+            checkpoints.add(new Pair(p.toCenterPos(),
+                new Pair<>(needsBreak ? "break" : "", needsBreak ? p : null)));
+        }
+        addVerifyPathCheckpoints();
+        state = State.Walking;
+    }
+
+    /** Slave-side: report the verify result to the master and park. */
+    private void reportVerifyDone(int remaining) {
+        verifyingForMaster = false;
+        SlaveSystem.queueMasterDM("verifyDone:" + remaining);
+        state = State.AwaitSlaveNextMap;
+        Utils.setForwardPressed(false);
+    }
+
+    // Master AFK anchoring + delegated finalize (hivemind duper anchoring)
+
+    /**
+     * True when the master should act as the duper chunk anchor in this hivemind:
+     * an AFK spot is configured and at least one slave exists (solo printing keeps
+     * today's behavior - the assumed external AFK account handles the dupers).
+     */
+    private boolean useAfkAnchor() {
+        return afkAnchor.get() && !SlaveSystem.isSlave() && afkSpot != null && !SlaveSystem.slaves.isEmpty();
+    }
+
+    /** Master walks to the AFK spot and stands there, keeping the duper chunks loaded. */
+    private void goAfk() {
+        if (state == State.Afk) return;
+        checkpoints.clear();
+        checkpoints.add(new Pair<>(afkSpot.getRight(), new Pair<>("parkAfk", null)));
+        state = State.Walking;
+        HiveLog.log("AFK master walking to the duper anchor spot");
+        info("My rows are done - walking to the AFK spot to anchor the dupers.");
+    }
+
+    /**
+     * Hands the physical finalize tasks (dump, cartography, finished-map chest,
+     * wipe) to a slave because the master is anchoring the dupers. Master-side
+     * bookkeeping (finalize flag, file rename) still happens here.
+     */
+    private void delegateFinalize(String preferred) {
+        // One-time per map: a slave verifies the canvas (quadrant-center walk +
+        // full rescan) BEFORE the finalize assignment goes out.
+        if (!verifyComplete) {
+            if (!SlaveSystem.slaves.isEmpty() && verifyAttempts < MAX_VERIFY_ATTEMPTS) {
+                assignVerify(preferred);
+                state = State.AwaitVerify;
+                return;
+            }
+            HiveLog.log("VERIFY skipped - no slaves available (attempts: " + verifyAttempts + ")");
+            verifyComplete = true;
+        }
+        // Fallback: no delegate available or the re-delegation cap is burned -
+        // the master runs the finalize itself instead of waiting in Afk forever.
+        if (SlaveSystem.slaves.isEmpty() || finalizeRedelegations >= 2) {
+            HiveLog.log("FINALIZE fallback - no delegate available, master runs the finalize itself"
+                + (finalizeRedelegations >= 2 ? " (re-delegate cap reached)" : ""));
+            warning("§cNo slave can run the finalize - the master is doing it itself.");
+            finalizeDelegate = null;
+            proceedMasterSelfFinalize();
+            return;
+        }
+        String slave = preferred != null && SlaveSystem.slaves.contains(preferred)
+            ? preferred : SlaveSystem.slaves.get(0);
+        finalizeDelegate = slave;
+        finalizeWatchdogTicks = 0;
+        finalizePhase = true;
+        cornerCounter = 0;
+        knownErrors.clear();
+        SlaveSystem.setAllSlavesUnfinished();
+        delegatedMapFileName = mapFile != null ? mapFile.getName() : null;
+        renameMapFile();
+        SlaveSystem.sendCommand(slave, HiveCommand.FINALIZE, null);
+        HiveLog.log("FINALIZE delegated to " + slave + " (master anchoring dupers)");
+        info("Finalize delegated to §a" + slave + "§7 - master is anchoring the dupers.");
+    }
+
+    /** Slave-side: executes the delegated finalize checkpoint sequence. */
+    @Override
+    public void runFinalize() {
+        if (!SlaveSystem.isSlave()) return;
+        if (dumpStation == null || finishedMapChest == null || mapCorner == null) {
+            warning("Cannot run delegated finalize: setup incomplete.");
+            return;
+        }
+        Pair<BlockPos, Vec3d> bestChest = getBestChest(Items.CARTOGRAPHY_TABLE);
+        if (bestChest == null) {
+            warning("Cannot run delegated finalize: no cartography material chest found.");
+            return;
+        }
+        finalizingForMaster = true;
+        finalizePhase = true;
+        state = State.Walking;
+        knownErrors.clear();
+        checkpoints.add(new Pair(dumpStation.getLeft(), new Pair("dump", null)));
+        checkpoints.add(new Pair(bestChest.getRight(), new Pair("mapMaterialChest", bestChest.getLeft())));
+        HiveLog.log("FINALIZE accepted - running dump/cartography/finished-chest/wipe");
+        info("Finalize delegated to me: running dump, cartography, finished-map chest and wipe...");
+    }
+
+    /** Master-side: the delegated finalize finished - exit AFK and load the next map. */
+    @Override
+    public void finalizeComplete() {
+        if (SlaveSystem.isSlave()) return;
+        finalizeDelegate = null;
+        finalizeWatchdogTicks = 0;
+        info("Delegate finished the finalize - loading the next map...");
+        state = State.AwaitNBTFile; // exits the Afk state: next tick loads/broadcasts the next map
+    }
+
+    /** Counts blocks the map expects but the world (verified) doesn't have. Unknown chunks count as missing. */
+    private int countMissingBlocksFullArea() {
+        return listMissingBlocksFullArea(0).size();
+    }
+
+    /** Lists missing blocks (up to {@code limit}, 0 = unlimited). Unknown (unloaded) chunks count as missing. */
+    private ArrayList<BlockPos> listMissingBlocksFullArea(int limit) {
+        ArrayList<BlockPos> missing = new ArrayList<>();
+        if (map == null || mapCorner == null) return missing;
+        for (int x = 0; x < 128 && (limit <= 0 || missing.size() < limit); x++) {
+            for (int z = 0; z < 128 && (limit <= 0 || missing.size() < limit); z++) {
+                if (map[x][z] == null) continue;
+                BlockState state = MapAreaCache.getVerifiedBlockState(mapCorner.add(x, 0, z));
+                if (state == null || state.isAir()) {
+                    missing.add(mapCorner.add(x, 0, z));
+                }
+            }
+        }
+        return missing;
     }
 
     public boolean triggerWipeSequence() {
@@ -1830,6 +2705,25 @@ public class CarpetPrinter extends Module implements MapPrinter {
         return true;
     }
 
+    /**
+     * Finds an empty player-inventory slot in the current screen handler
+     * (indices 36-44 = hotbar, 45+ = main inventory in the player screen handler).
+     */
+    private int findEmptyInventoryHandlerSlot() {
+        try {
+            var slots = mc.player.currentScreenHandler.slots;
+            for (int i = 0; i < slots.size(); i++) {
+                var slot = slots.get(i);
+                // Player inventory slots only (not the dumper's own container)
+                if (slot.inventory == mc.player.getInventory() && slot.getStack().isEmpty()) {
+                    return i;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return -1;
+    }
+
     private int getDumpSlot() {
         HashMap<Item, Integer> requiredItems = getRequiredItems();
         Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInformation = Utils.getInvInformation(requiredItems, availableSlots);
@@ -1853,14 +2747,16 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     if (adjustedX > workingInterval.getRight()) break;
                     int adjustedZ = z;
                     if (!northToSouth) adjustedZ = 127 - z;
-                    BlockState blockState = MapAreaCache.getCachedBlockState(mapCorner.add(adjustedX, 0, adjustedZ));
-                    if (blockState.isAir() && map[adjustedX][adjustedZ] != null) {
+                    // VERIFIED lookup: an unknown (unloaded) chunk counts as needing
+                    // material - conservative over-restock instead of under-restock
+                    BlockState blockState = MapAreaCache.getVerifiedBlockState(mapCorner.add(adjustedX, 0, adjustedZ));
+                    if ((blockState == null || blockState.isAir()) && map[adjustedX][adjustedZ] != null) {
                         if (!hasFoundAir) {
                             hasFoundAir = true;
-                            BlockState oppositeBlockState = MapAreaCache.getCachedBlockState(mapCorner.add(adjustedX, 0, 127 - adjustedZ));
+                            BlockState oppositeBlockState = MapAreaCache.getVerifiedBlockState(mapCorner.add(adjustedX, 0, 127 - adjustedZ));
                             // If the first air block does not have an opposite air block, the snake pattern got reversed at some point
-                            // We reverse the search too
-                            if (!oppositeBlockState.isAir() && z < 64) {
+                            // We reverse the search too (unknown chunks don't trigger a reversal)
+                            if (oppositeBlockState != null && !oppositeBlockState.isAir() && z < 64) {
                                 northToSouth = !northToSouth;
                                 restartZLoop = true;
                                 break;
@@ -2036,6 +2932,17 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
     public void setInterval(Pair<Integer, Integer> interval) {
         workingInterval = interval;
+        // Owner-only errors: a bot may only repair positions it owns. When the
+        // interval changes (re-split/steal/handoff), stale errors from the old
+        // assignment would make the new owner re-repair blocks another bot just
+        // fixed - or vice versa. Errors outside the new interval are dropped;
+        // whoever owns those rows now will re-detect them on their own scan.
+        if (knownErrors != null && mapCorner != null && interval != null) {
+            knownErrors.removeIf(p -> {
+                int row = p.getX() - mapCorner.getX();
+                return !Utils.isInInterval(interval, row);
+            });
+        }
     }
 
     public void addError(BlockPos relativeBlockPos) {
@@ -2053,6 +2960,9 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
     public void start() {
         if (SlaveSystem.isSlave()) {
+            // Never disturb an in-progress verify/finalize: a STALL re-partition
+            // sends START to every slave, which used to wipe the checkpoint path.
+            if (verifyingForMaster || finalizingForMaster) return;
             // Resume after a pause
             if (state.equals(State.AwaitSlaveContinue) && oldState != null && map != null
                 && (oldState == State.Walking || oldState == State.Dumping)) {
@@ -2094,12 +3004,21 @@ public class CarpetPrinter extends Module implements MapPrinter {
         // Work balancing: before parking this slave, give it the tail of the
         // busiest bot's remaining rows (only during the build phase).
         if (!finalizePhase && stealWork(slave)) return;
+        // AFK-anchor mode: master is parked at the dupers and every slave is done -
+        // delegate the finalize to this (last) slave instead of parking it.
+        // (ownUnfinished may be stale if the master handed its rows off already,
+        // so a parked master always delegates.)
+        if (useAfkAnchor() && !finalizePhase && (state == State.Afk || ownUnfinished <= 0)
+            && SlaveSystem.allSlavesFinished()) {
+            delegateFinalize(slave);
+            return;
+        }
         // Master assigns the finished slave one of the perimeter corners to park at
         if (perimeterCorners.isEmpty()) return;
         int corner = cornerCounter % perimeterCorners.size();
         cornerCounter++;
         HiveLog.log("PARK " + slave + " -> perimeter corner " + (corner + 1) + " (corner " + corner + ")");
-        SlaveSystem.queueDM(slave, "goToCorner:" + corner);
+        SlaveSystem.sendCommand(slave, HiveCommand.GO_TO_CORNER, String.valueOf(corner));
     }
 
     // Hivemind extensions (WebSocket transport)
@@ -2107,7 +3026,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
     private boolean hasFullSetup() {
         return resetButton != null && cartographyTable != null && finishedMapChest != null
             && dumpStation != null && mapCorner != null && !materialDict.isEmpty()
-            && !mapMaterialChests.isEmpty() && perimeterCorners.size() >= 4;
+            && !mapMaterialChests.isEmpty() && perimeterCorners.size() >= 4
+            && (!afkAnchor.get() || afkSpot != null);
     }
 
     @Override
@@ -2121,10 +3041,29 @@ public class CarpetPrinter extends Module implements MapPrinter {
             warning("No registered slaves to broadcast to.");
             return;
         }
-        SlaveSystem.sendToAllSlaves("config:" + ConfigSerializer.toJsonString(
+        // Debounce per slave: the invite/accept flow can trigger several
+        // broadcasts in a burst (~14KB each). A slave only needs the setup once
+        // per distinct payload - but a NEWLY registered slave must always
+        // receive it, even if the payload is identical to the last broadcast.
+        String payload = ConfigSerializer.toJsonString(
             "carpet", resetButton, cartographyTable, finishedMapChest, mapMaterialChests,
-            dumpStation, mapCorner, materialDict, perimeterCorners));
-        info("Setup broadcast to " + SlaveSystem.slaves.size() + " slave(s).");
+            dumpStation, mapCorner, materialDict, perimeterCorners, afkSpot);
+        if (!payload.equals(lastBroadcastPayload)) {
+            lastBroadcastPayload = payload;
+            slavesWithCurrentSetup.clear();
+        }
+        int sent = 0;
+        for (String slave : SlaveSystem.slaves) {
+            if (slavesWithCurrentSetup.contains(slave)) continue;
+            SlaveSystem.queueDM(slave, "config:" + payload);
+            slavesWithCurrentSetup.add(slave);
+            sent++;
+        }
+        if (sent == 0) {
+            HiveLog.log("SETUP broadcast skipped (all slaves already have this setup)");
+        } else {
+            info("Setup broadcast to " + sent + " slave(s).");
+        }
     }
 
     @Override
@@ -2140,7 +3079,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         // Welcome packet: setup, current map (if one is active) and a fresh interval.
         SlaveSystem.queueDM(slave, "config:" + ConfigSerializer.toJsonString(
             "carpet", resetButton, cartographyTable, finishedMapChest, mapMaterialChests,
-            dumpStation, mapCorner, materialDict, perimeterCorners));
+            dumpStation, mapCorner, materialDict, perimeterCorners, afkSpot));
 
         if (finalizePhase) {
             // The map is being finalized/wiped - park the newcomer at a corner,
@@ -2151,7 +3090,11 @@ public class CarpetPrinter extends Module implements MapPrinter {
             return;
         }
 
-        if (map != null && mapFile != null && (state == State.Walking || state == State.Dumping || state == State.AwaitMasterAllBuilt)) {
+        if (map != null && mapFile != null && (state == State.Walking || state == State.Dumping
+            || state == State.AwaitMasterAllBuilt || state == State.Afk)) {
+            // Afk included: while the master anchors the dupers the build phase is
+            // still running - a late joiner must receive the map or it idles in
+            // AwaitMasterMap forever (and its assigned rows are never built).
             sendMapTo(slave);
             SlaveSystem.queueDM(slave, "start");
         }
@@ -2216,6 +3159,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
             MapAreaCache.reset(mapCorner);
             this.materialDict = data.materialDict;
             this.perimeterCorners = (ArrayList<Pair<BlockPos, Vec3d>>) data.perimeterCorners;
+            this.afkSpot = data.afkSpot; // slaves receive it for future-proofing; only the master uses it
             info("Setup received from master.");
             if (state == null || state == State.AwaitSetup) state = State.AwaitMasterMap;
         } catch (Exception e) {
@@ -2245,6 +3189,9 @@ public class CarpetPrinter extends Module implements MapPrinter {
             pendingMapChunks.clear();
             pendingMapTotal = -1;
             pendingMapRetries = 0;
+            // Tell the master - otherwise it waits for us forever: with no map
+            // our rows can never be built and the whole hive stalls on this map.
+            SlaveSystem.queueMasterDM("mapFailed:" + fileName);
             return;
         }
         pendingMapRetries++;
@@ -2356,10 +3303,19 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
     @Override
     public void goToCorner(int cornerIndex) {
-        if (!SlaveSystem.isSlave() || perimeterCorners.size() <= cornerIndex) return;
+        if (!SlaveSystem.isSlave() || perimeterCorners.size() <= cornerIndex || mapCorner == null) return;
         Pair<BlockPos, Vec3d> corner = perimeterCorners.get(cornerIndex);
+        // Park AWAY from the map: a slave standing on the corner approach
+        // position physically blocks the master's/delegate's wipe perimeter
+        // walk, stalling the whole finalize before it even starts.
+        Vec3d parkPos = corner.getRight();
+        Vec3d center = mapCorner.add(64, 0, 64).toCenterPos();
+        Vec3d away = new Vec3d(parkPos.x - center.x, 0, parkPos.z - center.z);
+        if (away.lengthSquared() > 0.01) {
+            parkPos = parkPos.add(away.normalize().multiply(2.0));
+        }
         checkpoints.clear();
-        checkpoints.add(new Pair<>(corner.getRight(), new Pair<>("parkCorner", null)));
+        checkpoints.add(new Pair<>(parkPos, new Pair<>("parkCorner", null)));
         state = State.Walking;
         info("Walking to perimeter corner " + (cornerIndex + 1) + " to wait for the master...");
     }
@@ -2421,7 +3377,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 dumpStation,
                 mapCorner,
                 materialDict,
-                perimeterCorners);
+                perimeterCorners,
+                afkSpot);
             Text configText = Text.literal(configFile.getName())
                 .styled(style -> style
                     .withColor(Formatting.GREEN)
@@ -2455,6 +3412,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 State.SelectingPerimeterCorner4,
                 State.SelectingChests,
                 State.SelectingFinishedMapChest,
+                State.SelectingAfkSpot,
                 State.SelectingDumpStation,
                 State.SelectingTable,
                 State.SelectingMapArea,
@@ -2487,6 +3445,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
             MapAreaCache.reset(mapCorner);
             this.materialDict = data.materialDict;
             this.perimeterCorners = (ArrayList<Pair<BlockPos, Vec3d>>) data.perimeterCorners;
+            this.afkSpot = data.afkSpot;
             Text configText = Text.literal(configFile.getName())
                 .styled(style -> style
                     .withColor(Formatting.GREEN)
@@ -2494,8 +3453,13 @@ public class CarpetPrinter extends Module implements MapPrinter {
                     .withHoverEvent(new HoverEvent.ShowText(Text.literal("Open config")))
                     .withUnderline(true));
             info(Text.literal("Successfully loaded config: ").append(configText));
-            info("Type .startprinter to start printing.");
-            state = State.SelectingChests;
+            if (afkSpot == null && afkAnchor.get()) {
+                warning("Config has no AFK Spot - right-click it now (near the dupers), then re-save the config.");
+                state = State.SelectingAfkSpot;
+            } else {
+                info("Type .startprinter to start printing.");
+                state = State.SelectingChests;
+            }
             // Slaves may have registered before the config existed - broadcast it now
             if (!SlaveSystem.isSlave() && !SlaveSystem.slaves.isEmpty()) pendingSetupBroadcast = true;
         } catch (IOException e) {
@@ -2736,6 +3700,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         SelectingFinishedMapChest,
         SelectingDumpStation,
         SelectingTable,
+        SelectingAfkSpot,
         SelectingMapArea,
         AwaitRegisterResponse,
         AwaitRestockResponse,
@@ -2749,8 +3714,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
         AwaitSetup,
         AwaitMasterMap,
         AwaitMasterAllBuilt,
+        AwaitVerify,
         AwaitSlaveContinue,
         AwaitSlaveNextMap,
+        Afk,
         Walking,
         Dumping
     }

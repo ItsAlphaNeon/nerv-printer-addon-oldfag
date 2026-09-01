@@ -302,11 +302,29 @@ public final class Utils {
             for (int z = 127; z >= 0; z--) {
                 BlockPos relativePos = new BlockPos(x, 0, z);
                 BlockPos absolutePos = mapCorner.add(relativePos);
-                if (knownErrors.contains(absolutePos)) continue;
-                BlockState blockState = MapAreaCache.getCachedBlockState(absolutePos);
+                // NO knownErrors skip: the caller reconciles the list with this result,
+                // so every position is re-checked each scan and FIXED positions drop
+                // out of knownErrors. The old skip made the list append-only: repaired
+                // blocks stayed "errors" forever (log showed errorCount frozen at 379
+                // for 26 minutes) and the Repair loop re-broke blocks it had already
+                // fixed, every pass.
+                // VERIFIED lookup: an unknown (unloaded) chunk is skipped - it cannot
+                // be judged, and the legacy air-fallback would hide real errors
+                BlockState blockState = MapAreaCache.getVerifiedBlockState(absolutePos);
+                if (blockState == null) continue;
+                if (!blockState.getFluidState().isEmpty()) {
+                    // Water at carpet height (mid-wipe drain or leftover) - breaking it
+                    // is a no-op, so never flag it as a repairable error; the wipe /
+                    // area-clear checks own fluid handling.
+                    continue;
+                }
                 Block block = blockState.getBlock();
                 if (!blockState.isAir()) {
                     if (map[x][z] != block) invalidPlacements.add(absolutePos);
+                } else if (map[x][z] == null) {
+                    // Leftover block where the map expects nothing - it can never be
+                    // placed over, so it must be broken (this was the 379-error storm)
+                    invalidPlacements.add(absolutePos);
                 }
             }
         }

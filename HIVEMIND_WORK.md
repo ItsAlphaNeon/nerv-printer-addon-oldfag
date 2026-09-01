@@ -1,9 +1,316 @@
-# HIVEMIND_WORK.md — Session Summary (2026-08-30)
+# HIVEMIND_WORK.md — Session Summary (2026-08-30, updated 2026-08-31)
 
 This file documents everything done in this working session for the next agent to pick up.
 Everything below is implemented, compiles, and is built into `nerv-printer-1.21.11.jar`
 (via `build-no-test.bat`, which builds and copies the jar to 3 Prism Launcher instances:
 `Nerv Printer` (master), `Nerv Printer (Helper)`, `Nerv Printer (Helper 2)`).
+
+---
+
+## 0. 2026-09-01 addendum — error-system + ownership fixes (the "379 errors" session)
+
+Benchmark log `hive-master-2026-09-01_06-28-55.log` exposed three compounding bugs
+## 0e. 2026-09-01 v5 addendum — dump stall: inventory open/close resync as FIRST effort
+
+The dump-stall escalation chain now starts with a cheap unstick instead of jumping
+straight to forced throws:
+
+1. **5s stall (NEW, first effort):** open and close the player inventory ONCE
+   (`dumpInvResyncDone` guard - fires only once per stall, re-arms as soon as drops
+   go through again or the dump finishes/gives up). Closing a container makes the
+   server hand a phantom held/cursor item back to the inventory - the most common
+   silent cause of ignored THROW clicks. Logs `DUMP stall Ns ... inventory
+   open/close resync (first effort)`.
+2. 10s stall (unchanged): forced full-stack THROW every 2s, cursor PARK into an
+   empty slot every 3rd attempt.
+3. 20s stall (unchanged): give up, continue with excess items.
+
+
+## 0d. 2026-09-01 v4 addendum — HOTFIX: zero placements regression (absolute vs relative row)
+
+**Symptom:** "Not a single account placed a single carpet." Log signature: all bots
+BUILDING, unfinished counts frozen (43/42/43), progress messages perfectly periodic
+(one per line pass, 23s/30s), NO restock or dump activity - meaning the placement
+filter rejected every candidate and `tryPlacingBlock` never ran.
+
+**Root cause:** the v2 audit fix #11 (strict interval-bound placement) compared the
+ABSOLUTE world X (`blockPos.getX()`, here ~3,401,788) against the RELATIVE row
+interval (0-127) - always false, so no bot could ever place. One-line fix:
+`Utils.isInInterval(workingInterval, blockPos.getX() - mapCorner.getX())`.
+All other isInInterval call sites audited - they all use relative rows already.
+
+**Lesson:** interval rows are always RELATIVE to mapCorner; any new check that
+touches world positions must subtract mapCorner first (pattern: `rel =
+blockPos.subtract(mapCorner)` like the rest of the placement code).
+
+
+## 0c. 2026-09-01 v3 addendum — invite advertised the WRONG network IP (slave-join failures)
+
+**Symptom:** "some clients are failing to be slaves, even when invited". Log showed the
+master DM-inviting `hivemind:192.168.56.1:8080` - the **VirtualBox Host-Only adapter**.
+
+**Root cause:** `resolveLocalIp()` returned the FIRST site-local IPv4 of any up,
+non-loopback NIC and trusted `NetworkInterface.isVirtual()`. On Windows that method
+is unreliable - VirtualBox/Hyper-V/WSL adapters usually report `isVirtual() == false`,
+so the invite advertised an IP other PCs (and some firewall profiles) can never reach.
+Slaves then retried every 5s forever. The one client that worked had `master-address`
+manually set to `localhost` from earlier testing.
+
+**Fixes (all in):**
+- `resolveLocalIpDetailed()` + name-based virtual-adapter blocklist
+  (virtualbox/vbox/vmware/vmnet/hyper-v/vethernet/wsl/docker/tailscale/zerotier/
+  hamachi/nordvpn/wireguard/tunnel/teredo/isatap/tap-/tun-/virtual/loopback).
+  Clean adapters win; suspect adapters are only a last resort; loopback fallback.
+- New master setting **advertised-ip** (Multi User group): manual override for the IP
+  invites advertise. Wired via `SlaveSystem.advertisedIpOverride` (set on activate +
+  onChanged).
+- **Diagnostics:** `Invite players in range` now prints `Advertised IP: <ip>
+  (interface: <name>)` + a hint to set advertised-ip; Hivemind Status shows the
+  invite IP and whether it is auto-detected/override (with a loud warning when only
+  127.0.0.1 is available); slaves print a virtual-adapter/firewall hint every 3rd
+  failed connect attempt. New HiveLog marker: `INVITE advertised <ip>`.
+- Docs: CarpetGuide invite section updated.
+
+**Operator action for the current setup:** set `advertised-ip` on the master to the
+PC's real LAN IP (or keep using `master-address` on slaves as today) and re-invite.
+
+
+# HIVEMIND_WORK.md — Session Summary (2026-08-30, updated 2026-09-01 v2)
+
+## 0b. 2026-09-01 v2 addendum — audit fixes + pre-finalize VERIFY pass (all in, built & deployed)
+
+A full audit found 14+ failure/loop/deadlock scenarios. All critical/high ones are fixed:
+
+### Pre-finalize VERIFY pass (the headline feature)
+- Before ANY finalize assignment (self-finalize OR delegated), the master assigns a
+  slave (`verify` command, ACKed) to verify the canvas: it walks the **4 quadrant
+  centers** (`+32/+96` — loads every chunk), then runs a full-area scan
+  (`listBuildIssuesFullArea`: missing = air at expected block, wrong = block identity
+  mismatch, leftover = non-air at null cell; fluids skipped; unknown chunks = missing).
+- Up to **3 repair rounds**: break wrong/leftover blocks, walk to air gaps so the
+  placement loop re-places them (owner-neutral placement bypass), then rescan.
+- Reports `verifyDone:<remaining>`; master proceeds with finalize (0 = clean, >0 =
+  wipe gate will hold if the issues matter). Heartbeat phase `VERIFYING`.
+- Watchdog: 5 min without `verifyDone` -> re-assign another slave (max 3 attempts/map,
+  `MAX_VERIFY_ATTEMPTS`), then continue without verify (wipe gate remains as backstop).
+- Slave `start()` ignores START while `verifyingForMaster || finalizingForMaster`
+  (a STALL re-partition START used to wipe the verify/finalize checkpoint path).
+- The verifier never touches the bot's own interval - owner-neutral by design.
+
+### Audit fixes (each maps to an audit finding)
+1. **Orphaned rows after re-split while master parked**: `SlaveSystem.masterRowsHandedOff`
+   (set by `handOffMasterRows`, cleared at map start). `generateIntervals` keeps the
+   master at `0:-1` and calls `repartitionAmongSlaves(null)` instead of splitting rows
+   to the parked master. Also `repartitionAmongSlaves(String exclude)` - the STALL
+   watchdog excludes the wedged bot from the partition (it used to receive fresh rows
+   it could never build and burn both attempts).
+2. **Late joiner while master is Afk**: `slaveRegistered` now sends map+start in `Afk`
+   state too (it used to idle in AwaitMasterMap forever with rows it could not build).
+3. **Map-less/setup-less slaves were invisible**: heartbeat phase `NOMAP` + unfinished =
+   whole interval when map==null (old code reported 0 -> master waited forever).
+   Slave map transfer give-up now sends `mapFailed:<file>`; master drops that slave
+   and re-splits instead of stalling.
+4. **Master-owned error rows**: at lineEnd, if EVERY unfinished master row holds a
+   known error, the master hands its rows off (`handOffMasterRows`) - slaves re-scan
+   and repair. (Non-anchor master used to loop on error rows forever / orphan them on
+   steal.) The wipe gate now also blocks on **wrong blocks** and leftovers (it only
+   saw air gaps before - wrong colors silently ruined the crafted map item).
+5. **endBuilding failure loop**: no cartography chest -> HOLD + toggle off with a loud
+   message (`proceedMasterSelfFinalize`), instead of the old every-tick
+   "Finished building map" infinite loop.
+6. **Empty material chest infinite ping-pong**: `endRestocking` gives up when every
+   known chest for the material was visited empty (`RESTOCK HOLD` + toggle off); the
+   old getBestChest clear+recurse returned the same chest forever.
+7. **AwaitAreaClear forever**: 5 min timeout -> re-run wipe (max 3) -> `WIPE HOLD`
+   loud message. Counters reset on area clear / map start.
+8. **Delegated finalize re-delegation cap**: max 2 re-delegates per map
+   (`finalizeRedelegations`); after that - or when no other slave exists - the master
+   runs the finalize itself (exits Afk) instead of ping-ponging/waiting forever.
+9. **Corner parking blocked the wipe**: parked slaves now stand ~2 blocks AWAY from
+   the map (direction from map center) so the wipe perimeter walk is not blocked.
+10. **Silent disappearance**: slave module deactivation sends `leaving` (master
+    unregisters + re-splits WITHOUT sending "remove" back - it would re-activate the
+    just-disabled module); master deactivation pauses all slaves.
+11. **Placement cross-ownership**: placement window now strictly interval-bound
+    (`isInInterval`), except verify/finalize phases (owner-neutral by design).
+12. Late joiners during AwaitVerify are parked (finalizePhase) - unchanged.
+
+### Crash-risk guards added
+- After `endBuilding` assigns verify (state `AwaitVerify`, empty checkpoints), both
+  call sites bail out instead of falling into `checkpoints.get(0)`.
+
+### New protocol commands
+- `verify` (M->S, ACKed), `verifyDone:<n>` (S->M), `mapFailed:<file>` (S->M),
+  `leaving` (S->M). `MapPrinter` gained `runVerify()` + `verifyDone(String,int)`
+  (Staircased: no-op stubs).
+
+### New log markers
+`VERIFY assigned/accepted/round/scan clean/timeout/cap`, `MAP FAILED`, `LEAVING`,
+`RESTOCK HOLD`, `WIPE HOLD`, `WIPE retry`, `FINALIZE fallback`, `INTERVALS reassigned
+-> master: none (anchored)`, `ERRORS occupy all N of my unfinished rows`.
+
+### Deliberately deferred (audit findings, lower priority)
+- AwaitBlockBreak attempt cap (a protected block hangs the verifier -> the verify
+  watchdog re-assigns, so it self-heals slowly).
+- mapOk handshake gating "start" (NOMAP heartbeat + mapFailed drop cover the flow).
+- AwaitButtonPress state verification before "Continuing anyway" (AwaitAreaClear
+  timeout now bounds the damage).
+
+
+(slaves stuck in repair loops for 26+ min, tearing up corrected blocks; hive never
+finished). All fixed:
+
+- **knownErrors was append-only** (`getInvalidPlacements` skipped positions already in
+  the list; nothing ever removed them). Fixed blocks stayed "errors" forever -> the
+  heartbeat error count froze (379 for 26 min) and the Repair loop re-broke fixed
+  blocks every pass. FIX: `Utils.getInvalidPlacements` re-checks every position (no
+  skip) and the lineEnd handler RECONCILES (`clear(); addAll(newErrors)`) so the list
+  is always exactly the currently-wrong set.
+- **Repair route re-broke everything** (`ErrorAction.Repair` built break-checkpoints
+  from the full knownErrors list unverified). FIX: verify-before-break - only positions
+  whose current verified state still mismatches the map get a break checkpoint; empty
+  result -> just re-scan.
+- **Leftover blocks where the map expects nothing** (dirty canvas from an incomplete
+  wipe) are now flagged as errors by the scan (air-at-null-cell) so Repair breaks them;
+  FLUIDS are explicitly skipped (breaking water is a no-op - flagging them created
+  un-removable errors).
+- **Union-merge handoff created OVERLAPPING intervals** (master 0-42 + slaves 43-85 /
+  86-127 -> 0-85 and 21-127; rows 21-85 double-owned -> cross-bot repair wars).
+  FIX: `SlaveSystem.repartitionAmongSlaves()` - full disjoint weighted re-partition of
+  0-127 among slaves (master keeps none); `handOffMasterRows` calls it; disjointness
+  asserted in the log (`CRITICAL ... OVERLAP` must never fire).
+- **Owner-only errors**: `setInterval` drops knownErrors outside the new interval
+  (stale errors from an old assignment made bots re-repair other bots' fixed blocks).
+- **Stall watchdog** (master sweep): a slave with an unchanged unfinished-row count >0
+  for 5 min -> `STALL` log + re-partition among slaves (max 2/map, then loud chat).
+  Reset on MAP START.
+- **Dirty-canvas scan** at MAP START: non-air leftovers at null cells in the bot's own
+  interval get break-checkpoints up front (`CANVAS DIRTY` log, cap 512) instead of
+  surfacing as a mid-map error storm.
+- Heartbeat phase: a paused AFK master (`AwaitSlaveContinue` w/ oldState Afk) reports
+  ANCHORING (no more ANCHORING/BUILDING flicker after pause/resume).
+
+New log markers: `CANVAS DIRTY`, `STALL`, `HANDOFF re-partition`,
+`CRITICAL ... OVERLAP` (must never appear).
+
+## 0a. 2026-08-31 addendum — efficiency + protocol hardening (Phase 1-3 COMPLETE)
+### Work distribution
+- **Work-weighted interval split** (`generateIntervals`): rows split by per-row block
+  counts from the parsed map (`MapPrinter.getRowBlocks()`), not equal row counts.
+  Falls back to equal-row split without a map. Tag in log: `[AFK-ANCHOR...]` / `[no afk-anchor]`.
+- **Work stealing**: slaves report `progress:<unfinishedRows>` at line end; master's 30s
+  sweep steals the far tail of the busiest bot for an idle bot (`STEAL` log lines).
+  MIN_STEAL_ROWS=8, MIN_STEAL_AMOUNT=4.
+- **AFK anchor mode** (`afk-anchor` toggle + AFK Spot in the config setup): the master
+  builds the duper-adjacent rows, then parks at the AFK spot (`State.Afk`) to keep duper
+  chunks loaded. Master excluded from error repair/reset/toggle-off in hivemind mode
+  (`ERRORS N skipped by master`). If the master's only remaining rows contain known
+  errors, it hands ALL rows off (`HANDOFF` log, union-merged intervals, fires once per
+  map via `rowsHandedOff`, master interval set to 0:-1 empty) and goes AFK.
+- **Delegated finalize**: last `finished` slave receives `finalize` and runs
+  dump->cartography->finished chest->wipe; master does bookkeeping only
+  (`delegatedMapFileName` captured to protect the rename; 3min watchdog re-delegates).
+  Slave replies `finalizeDone` -> master loads next map.
+
+### Map transfer reliability
+- Chunked transfer: `map:<file>:<crc32>:<totalChunks>:<chunkIdx>:<data>` (~300KB base64
+  chunks), slave reassembles + CRC-verifies, auto re-requests via `remap` up to 5
+  attempts (`requestRemap`), 5s stall watchdog, per-map attempt counter resets.
+- Slave-side write verifies byte count; parse failures are stage-logged
+  (`NBT LOAD <f> STAGE parse FAILED (file N bytes): <exception>`).
+
+### Dump/restock hardening
+- Dump watchdog: 3s `DUMP slow` telemetry -> 10s forced full-stack THROW -> cursor-reset
+  intervention (PICKUP on an empty player slot, fixes server-side phantom-cursor desync)
+  -> 20s give up and continue with excess items. `timeoutTicks` always ticks during dump.
+
+### Phase 1 (bug fixes, all in)
+- `MapAreaCache.getVerifiedBlockState()` returns **null for unknown/unloaded chunks**;
+  ALL completion checks treat null as NOT finished (line-finished scan,
+  `countUnfinishedRowsInInterval`, `Utils.getInvalidPlacements`, `getRequiredItems`).
+  Legacy `getCachedBlockState` kept for placement, warning rate-limited 5s.
+- **Wipe-completeness gate** in `AwaitFinishedMapChestResponse` (covers master AND
+  delegate): `listMissingBlocksFullArea(25)` scan before any wipe; missing -> repair
+  round (break + lineEnd re-place, max 3) -> `WIPE BLOCKED` logs; 3 failures -> HOLD,
+  never wipes.
+- Commands now sequenced/ACKed (below) at all assign/steal/handoff/park/finalize sites.
+
+### Phase 2 (protocol redesign, all in)
+- `utils/HiveCommand.java`: typed enum, every command declares Direction
+  (TO_SLAVE/TO_MASTER/BOTH) + needsAck. `handleMessage` parses once and dispatches on
+  direction - wrong-side handlers are structurally impossible. Unknown commands logged
+  and dropped. Wire compat: `parseCompat` keeps legacy names.
+- ACKs: `interval/start/pause/finalize/goToCorner` carry `<seq>:` prefix; slave applies
+  then replies `ack:<seq>`; master retries every 2s x3 then `CMD ... FAILED after 3
+  attempts`. NOTE: ack parsing accepts both `ack:<seq>` and `<seq>:ack` forms (bug found
+  in self-audit: "ack:5" has no leading digit, seq must come from args).
+- Heartbeats every 10s: slave sends `hb:<phase>,<start>,<end>,<unfinished>,<errors>`
+  (phase BUILDING/ANCHORING/FINALIZING/PARKED/IDLE via `MapPrinter.getHeartbeatData()`);
+  master feeds `onSlaveProgress`, **drift-corrects** interval mismatches (re-sends
+  interval), warns on 30s heartbeat gaps. Master logs its own heartbeat.
+- Idempotent handlers: duplicate `accept` and duplicate `finished` ignored + logged.
+- `config:` broadcast debounced per-slave per-payload (`slavesWithCurrentSetup`; a new
+  slave always receives it; payload change resets the set).
+
+### Phase 3 (cleanup, all in)
+- `ERRORS N pending on master` log throttled to 30s. MapAreaCache fallback warning
+  throttled. Dead `mine`/`skip` commands retained (harmless no-ops on CarpetPrinter).
+- **Log markers to know**: `CMD`, `ACK`, `HEARTBEAT`, `HEARTBEAT MISSING`, `HEARTBEAT
+  drift`, `STEAL`, `HANDOFF`, `PARK`, `FINALIZE delegated/complete`, `WIPE BLOCKED`,
+  `MAP SEND/RECEIVE`, `SETUP broadcast skipped`, `DUMP ...`, `INTERVALS reassigned`.
+
+### Benchmark / operator commands (master)
+- `.startprinter` — starts printing (requires module active, correct state, chests set,
+  map NBT loaded; each failure mode has a distinct chat message instead of crashing).
+- `.pauseprint` / `.resumeprint` — pause/resume the ENTIRE hivemind: master pauses
+  in place (`AwaitSlaveContinue`) and every slave gets pause/start. Logged as
+  `HIVE PAUSE requested` / `HIVE RESUME requested`. Solo printing still works (pauses
+  just the local bot).
+- `afk-anchor` toggle (Carpet Printer -> General): ON = master builds duper-adjacent
+  rows, anchors dupers, delegates finalize. OFF = raw speed (master takes middle
+  section, steals when idle, runs finalize itself). Honored live at the next 30s sweep;
+  also gates whether the AFK Spot is required by `hasFullSetup()`.
+
+### Hive log (observability)
+- `utils/HiveLog.java`: master-only, thread-safe, auto-flush. Location:
+  `.minecraft/nerv-printer/hive_logs/hive-master-<timestamp>.log` (same folder as the
+  NBTs/configs). Created LAZILY on the first slave socket message - a solo master never
+  creates one. Payloads >160 chars truncated. `IN `/`OUT ` wire lines for every message.
+- `HiveLog.enable()` is called from `onSocketMessage` when a slave connects; logging
+  no-ops on slaves and when no printer module is active.
+- Map NBT transfer now CHUNKED with CRC32 (`map:<file>:<crc>:<total>:<idx>:<data>`),
+  slave auto re-requests (`remap`) up to 5x with reasons, 5s stall watchdog.
+  `requestRemap(fileName, reason)` is the single failure funnel. Note: remap/progress
+  handlers must be on the MASTER side switch - the typed dispatch in HiveCommand now
+  enforces this, but know the history: these commands were once silently dead on the
+  wrong side for a whole benchmark run.
+
+### Crash/bug fix history (gotchas to not regress)
+- **`map` NPE on `.startprinter`**: loading a config while the module is INACTIVE is
+  allowed (pre-stages setup) but does NOT load the NBT - `startPrinting` validates
+  module active -> state -> chests -> map loaded, each with a clear chat message.
+  Required order: NBT in folder -> enable module (loads map) -> `.startprinter`.
+- **`sendToSocket` null-player guard**: sends during game shutdown are dropped silently
+  (log still written) - do not remove, it fixed a shutdown NPE.
+- **Chest interrupt deadlock**: `handleInventoryPacket` must always resolve
+  `AwaitRestockResponse` (empty restock list -> `endRestocking()`; needs-0-more ->
+  clear backlog + `endRestocking()`), plus a 10s `AwaitRestockResponse` stall watchdog
+  that re-plans the refill. Without all three, the bot stares at a chest forever.
+- **Error-row logic**: master counts as "done" only when EVERY unfinished row contains a
+  known error (`errorRowsInInterval >= ownUnfinished`), never "some error exists".
+- **`SlaveSystem` is fully static and shared by BOTH modules** - keep the
+  module-instance check in `setupSlaveSystem` intact. Heartbeat/ACK maps are cleared on
+  module-instance reset and slave removal.
+- **Wire format**: `<seq>:<command>[:args]` where seq is optional; the parse accepts
+  both `ack:<seq>` and `<seq>:ack`. Bulk `config:`/`map:` payloads are handled BEFORE
+  the split-parse (they contain colons/base64 and must never go through it).
+
+### Known open items
+- Master failover (slave takeover) deferred - heartbeats lay groundwork.
+- `mine`/`skipBuilding` are empty on CarpetPrinter; kept in protocol.
+- StaircasedPrinter multi-bot still deprecated (stubs for all new interface methods).
+- Manual "Send Setup" GUI button may be debounce-skipped if payload unchanged and all
+  slaves already have it (logged) - change the setup in-game to force a re-send.
 
 ---
 
