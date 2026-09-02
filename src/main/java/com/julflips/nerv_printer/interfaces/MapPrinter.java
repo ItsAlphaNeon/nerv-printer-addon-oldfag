@@ -49,7 +49,14 @@ public interface MapPrinter {
     void onSlaveProgress(String slave, int unfinishedRows);
 
     /**
-     * Master-side: true when AFK-anchor mode is active, so the master should be
+     * Diagnostic suffix for interval logs explaining the AFK-anchor decision
+     * (why the master did or did not take the duper-adjacent rows).
+     */
+    default String afkAnchorStatus() {
+        return "";
+    }
+
+    /** True when AFK-anchor mode is active, so the master should be
      * assigned the first (duper-adjacent) row section instead of the middle one.
      */
     boolean usesAfkAnchorRows();
@@ -70,11 +77,17 @@ public interface MapPrinter {
     /** Master-side: the delegated slave completed the finalize - load the next map. */
     void finalizeComplete();
 
-    /**
-     * Master-side: the verifying slave finished its pre-finalize canvas scan.
+    /** Master-side: the verifying slave finished its pre-finalize canvas scan.
      * {@code remaining} is the number of unresolved issues (0 = clean).
      */
     void verifyDone(String slave, int remaining);
+
+    /**
+     * Slave-side: this bot accepted a hivemind invite via whisper. Leave the
+     * master setup flow (it is otherwise stuck in the chest-selection states)
+     * and wait for the master's setup broadcast.
+     */
+    void onInviteAccepted();
 
     void goToCorner(int cornerIndex);
 

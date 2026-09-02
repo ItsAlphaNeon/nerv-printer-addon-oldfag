@@ -10,6 +10,58 @@ Everything below is implemented, compiles, and is built into `nerv-printer-1.21.
 ## 0. 2026-09-01 addendum — error-system + ownership fixes (the "379 errors" session)
 
 Benchmark log `hive-master-2026-09-01_06-28-55.log` exposed three compounding bugs
+## 0g. 2026-09-01 v7 addendum — master took middle rows with anchor inactive (silent fallback)
+
+**Symptom:** "Master abandoned their required 1-64 lines for the middle assignment,
+leaving the dupers to break." Log: both re-splits tagged `[no afk-anchor]` - with
+AFK-anchor inactive, the master deliberately takes the MIDDLE section and walks
+away from the duper-adjacent rows; nobody anchors the dupers and their chunks
+unload. The fallback was completely silent (no reason, no warning).
+
+**Root cause of the surprise:** `usesAfkAnchorRows()` = afkAnchor toggle ON &&
+afkSpot != null. This run had it inactive (toggle OFF, or AFK spot missing - the
+config-load prompt "Config has no AFK Spot" can be skipped and nothing re-warns).
+
+**Fixes (all in):**
+- New `MapPrinter.afkAnchorStatus()` (default method): interval logs now say WHY -
+  `[no afk-anchor: toggle is OFF...]` vs `[no afk-anchor: AFK-anchor is ON but NO
+  AFK SPOT is set - master took middle rows, DUPERS MAY BREAK]` vs
+  `[AFK-ANCHOR: master on duper-adjacent rows]`.
+- `.startprinter` warns loudly (chat + HiveLog `AFK-ANCHOR INACTIVE at start`)
+  when the anchor is inactive in hivemind mode, naming the fix (toggle on /
+  right-click the AFK spot and re-save the config).
+- Heartbeat phase `PAUSED` (a paused bot used to keep reporting BUILDING).
+
+**Operator note:** for duper anchoring, afk-anchor must be ON and the AFK Spot
+must be set on the master BEFORE `.startprinter`.
+
+
+## 0f. 2026-09-01 v6 addendum — invite-flow slaves silently ignored invites (self-hosting default)
+
+**Symptom:** "slaves that receive an invite via whisper no longer do anything"
+(all modules on and reset, invite whisper arrives, no "Joining hivemind" message).
+
+**Root cause:** an invite-flow slave has an EMPTY master-address - and
+`isMasterMode()` is DEFINED as "empty address". So on activation the slave ran the
+MASTER path and `ensureServer()` bound port 8080 (succeeds when the master is on a
+different PC; on the old single-PC setup the bind FAILED against the master's 8080,
+which masked this). The invite then hit `handleInvite`'s first guard
+`if (serverStarted) return;` - silently dropped. The slave also sat in the master
+chest-selection flow instead of AwaitSetup.
+
+**Fixes (all in):**
+- `handleInvite`: `serverStarted` no longer auto-rejects. If we host but have NO
+  hive of our own (no slaves/connections/pending), we are a stranded default-host:
+  stop the server and accept the invite. A real master (has slaves) refuses loudly.
+- New `MapPrinter.onInviteAccepted()` (Staircased: no-op stub). CarpetPrinter impl:
+  syncs the `master-address` SETTING to the joined IP (so a later re-toggle stays
+  slave mode instead of re-hosting) and transitions to `AwaitSetup`.
+
+**Lesson:** "empty master-address = master" makes every invite-flow slave a
+would-be host on activation. Any new guard keyed on serverStarted must consider
+the empty-hive case.
+
+
 ## 0e. 2026-09-01 v5 addendum — dump stall: inventory open/close resync as FIRST effort
 
 The dump-stall escalation chain now starts with a cheap unstick instead of jumping

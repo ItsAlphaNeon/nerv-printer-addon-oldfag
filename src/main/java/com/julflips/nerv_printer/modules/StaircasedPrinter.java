@@ -1846,6 +1846,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     public void verifyDone(String slave, int remaining) {
     }
 
+    @Override
+    public void onInviteAccepted() {
+    }
+
     public void finalizeComplete() {
     }
 

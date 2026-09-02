@@ -2047,6 +2047,18 @@ public class CarpetPrinter extends Module implements MapPrinter {
         ownUnfinished = 0;
     }
 
+    /**
+     * Diagnostic suffix for interval logs explaining the AFK-anchor decision -
+     * a silent fallback to middle rows left the dupers unloaded without any
+     * hint WHY (toggle off vs missing AFK spot).
+     */
+    public String afkAnchorStatus() {
+        if (SlaveSystem.isSlave()) return " [slave - no anchor role]";
+        if (!afkAnchor.get()) return " [no afk-anchor: toggle is OFF - master took middle rows]";
+        if (afkSpot == null) return " [no afk-anchor: AFK-anchor is ON but NO AFK SPOT is set - master took middle rows, DUPERS MAY BREAK]";
+        return " [AFK-ANCHOR: master on duper-adjacent rows]";
+    }
+
     /** True when AFK-anchor mode is on and the spot is configured. */
     @Override
     public boolean usesAfkAnchorRows() {
@@ -2058,6 +2070,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         String phase;
         if (state == State.Afk
             || (state == State.AwaitSlaveContinue && oldState == State.Afk)) phase = "ANCHORING";
+        else if (state == State.AwaitSlaveContinue) phase = "PAUSED";
         else if (verifyingForMaster) phase = "VERIFYING";
         else if (map == null) phase = "NOMAP";
         else if (finalizePhase) phase = "FINALIZING";
@@ -2927,6 +2940,20 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (!setupSlots()) {
             return;
         }
+        // Make an inactive AFK-anchor LOUD before anything starts: with the
+        // anchor inactive the master takes the middle rows and walks AWAY from
+        // the dupers - their chunks unload and the duper farm breaks silently.
+        if (!SlaveSystem.isSlave() && !SlaveSystem.slaves.isEmpty()) {
+            if (!afkAnchor.get()) {
+                warning("AFK-anchor is OFF - the master will build the MIDDLE rows and nobody anchors the dupers."
+                    + " Turn the afk-anchor setting ON and set an AFK Spot if the dupers must stay loaded.");
+                HiveLog.log("AFK-ANCHOR INACTIVE at start (toggle off) - dupers are NOT anchored");
+            } else if (afkSpot == null) {
+                warning("§cAFK-anchor is ON but no AFK Spot is configured - the master took middle rows and the dupers are NOT anchored."
+                    + " Right-click the AFK spot to set it, then re-save the config.");
+                HiveLog.log("AFK-ANCHOR INACTIVE at start (no AFK spot) - dupers are NOT anchored");
+            }
+        }
         startBuilding();
     }
 
@@ -3022,6 +3049,23 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     // Hivemind extensions (WebSocket transport)
+
+    /**
+     * Slave-side: this bot accepted an invite. It activated with an empty
+     * master-address (so it went through the MASTER setup flow - and was even
+     * self-hosting) - leave that flow and wait for the master's setup instead.
+     * The master-address setting is synced too, so a later module re-toggle
+     * keeps this bot in slave mode instead of re-hosting its own hive.
+     */
+    @Override
+    public void onInviteAccepted() {
+        String joinedAddress = SlaveSystem.masterAddress;
+        if (!masterAddress.get().equals(joinedAddress)) {
+            masterAddress.set(joinedAddress); // onChanged re-syncs SlaveSystem (same value)
+        }
+        state = State.AwaitSetup;
+        info("Invite accepted - waiting for setup from master " + joinedAddress + "...");
+    }
 
     private boolean hasFullSetup() {
         return resetButton != null && cartographyTable != null && finishedMapChest != null

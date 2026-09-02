@@ -482,8 +482,7 @@ public final class SlaveSystem {
             sendCommand(slave, HiveCommand.INTERVAL, interval.getLeft() + ":" + interval.getRight());
         }
         slaveIntervals.keySet().removeIf(s -> !slaves.contains(s));
-        HiveLog.log(assignment.toString()
-            + (printerModule.usesAfkAnchorRows() ? " [AFK-ANCHOR: master on duper-adjacent rows]" : " [no afk-anchor]"));
+        HiveLog.log(assignment + printerModule.afkAnchorStatus());
 
         // Hivemind: parked (already finished) slaves may have received new rows -
         // re-activate them so the re-split rows actually get built.
@@ -741,7 +740,21 @@ public final class SlaveSystem {
 
     /** Slave side: parse a received invite and join the master's socket server. */
     private static void handleInvite(String sender, String ip, String port) {
-        if (serverStarted) return;                                  // We host ourselves, ignore invites
+        // "Hosting" is the DEFAULT for an empty master-address - an invite-flow
+        // slave binds 8080 on activation and then SILENTLY DROPPED every invite
+        // here. Only a bot with an actual hive of its own must refuse invites.
+        if (serverStarted) {
+            if (!slaves.isEmpty() || !slaveConnections.isEmpty() || !toBeConfirmedSlaves.isEmpty()) {
+                ChatUtils.warning("Ignoring invite from " + sender + " - I am hosting a hive with "
+                    + slaves.size() + " slave(s).");
+                return;
+            }
+            // Nobody joined us - we are a stranded default-host, not a real
+            // master. Accept the invite and stop hosting.
+            ChatUtils.info("Invite accepted - closing my empty hosting session to join " + sender + "...");
+            HiveLog.log("INVITE accepted while self-hosting (no slaves) - stopping my server and joining " + sender);
+            stopServer();
+        }
         if (client != null && client.isOpen()) return;              // Already connected
         if (master != null) return;                                 // Already part of a hive
         if (!canSeePlayer(sender)) return;                          // Anti-spoof: sender must be in render distance
@@ -755,6 +768,9 @@ public final class SlaveSystem {
         masterPort = parsedPort;
         connectAttempts = 0;
         ChatUtils.info("Joining hivemind of §a" + sender + "§7 at " + ip + ":" + parsedPort + "...");
+        // Leave the master setup flow - an invited slave must not sit in the
+        // chest-selection states waiting for a map area that will never come.
+        printerModule.onInviteAccepted();
         ensureClient();
     }
 
