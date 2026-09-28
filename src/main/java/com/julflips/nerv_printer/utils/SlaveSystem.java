@@ -122,6 +122,16 @@ public final class SlaveSystem {
         master = null;
     }
 
+/**
+     * Slave side: its printer module deactivated. Send "leaving" BEFORE calling
+     * this, then forget the master and close the socket so a later
+     * re-activation opens a FRESH connection and the master's auto-register
+     * handshake can re-register us (an open socket is never a "new connection").
+     */
+    public static void slaveLeftHive() {
+        stopClient();
+    }
+
     /** Prints the current hivemind state to the local chat for quick diagnosis. */
     public static void printHivemindStatus() {
         if (printerModule == null) return;
@@ -311,6 +321,12 @@ public final class SlaveSystem {
         mc.execute(() -> {
             if (printerModule == null) return;
             if (conn != null && !slaveConnections.containsKey(conn)) {
+                // A reconnecting peer can briefly own two sockets under one name
+                // (stale socket + fresh socket). Drop the stale mapping so there
+                // is exactly ONE socket per name - otherwise the old socket's
+                // close event later evicts the registration that now belongs to
+                // the fresh socket (slave locked out of the hive).
+                slaveConnections.values().removeIf(n -> n.equals(sender));
                 slaveConnections.put(conn, sender);
                 toBeConfirmedSlaves.add(sender);
                 ChatUtils.info("New connection: " + sender);
@@ -442,6 +458,9 @@ public final class SlaveSystem {
         // re-split (slave join/disconnect) must keep it that way. Assigning the
         // parked master real rows would orphan them forever (it can never build
         // them, rowsHandedOff blocks a re-handoff and the wipe gate then holds).
+        // EXCEPTION: the last slave left - a parked master alone can never finish
+        // the map, so hand ownership back to it (the module wakes up from Afk).
+        if (masterRowsHandedOff && slaves.isEmpty()) masterRowsHandedOff = false;
         if (masterRowsHandedOff && !slaves.isEmpty()) {
             printerModule.setInterval(new Pair<>(0, -1));
             HiveLog.log("INTERVALS reassigned -> master: none (anchored)");
@@ -515,12 +534,37 @@ public final class SlaveSystem {
 
     public static void repartitionAmongSlaves(String exclude) {
         ArrayList<String> participants = new ArrayList<>(slaves);
-        if (exclude != null) participants.removeIf(s -> s.equals(exclude));
+        if (exclude != null) {
+            participants.removeIf(s -> s.equals(exclude));
+            // The excluded bot keeps NO rows: it was excluded because it cannot
+            // work. Letting it hold its old interval would double-assign those
+            // rows to the bots that just received them (and the heartbeat drift
+            // correction would keep re-asserting its dead interval).
+            if (slaves.contains(exclude)) {
+                slaveIntervals.remove(exclude);
+                sendCommand(exclude, HiveCommand.INTERVAL, "0:-1");
+                HiveLog.log("HANDOFF excluded slave " + exclude + " - interval cleared (0:-1)");
+            }
+        }
         if (participants.isEmpty()) return;
         int n = participants.size();
         int[] rowBlocks = printerModule.getRowBlocks();
-        ArrayList<Pair<Integer, Integer>> intervals =
-            (rowBlocks != null && rowBlocks.length == 128) ? weightedIntervals(rowBlocks, n) : equalIntervals(n);
+        // The master may keep its own rows (non-anchor mode): a re-partition that
+        // hands ALL of 0-127 to the slaves would DOUBLE-ASSIGN the master's rows
+        // and start cross-bot repair wars. Only the free rows are distributed.
+        Pair<Integer, Integer> reserved = printerModule.reservedMasterInterval();
+        ArrayList<Pair<Integer, Integer>> intervals;
+        if (reserved != null && reserved.getLeft() >= 0 && reserved.getRight() >= reserved.getLeft()) {
+            ArrayList<Integer> freeRows = new ArrayList<>();
+            for (int r = 0; r < 128; r++) {
+                if (!Utils.isInInterval(reserved, r)) freeRows.add(r);
+            }
+            if (freeRows.isEmpty()) return;
+            intervals = splitRows(freeRows, rowBlocks, n);
+        } else {
+            intervals =
+                (rowBlocks != null && rowBlocks.length == 128) ? weightedIntervals(rowBlocks, n) : equalIntervals(n);
+        }
 
         ArrayList<String> sortedSlaves = new ArrayList<>(participants);
         Collections.sort(sortedSlaves, String.CASE_INSENSITIVE_ORDER);
@@ -546,6 +590,13 @@ public final class SlaveSystem {
                         + a.getLeft() + "-" + a.getRight() + " vs " + b.getLeft() + "-" + b.getRight());
                 }
             }
+            if (reserved != null) {
+                Pair<Integer, Integer> a = intervals.get(i);
+                if (a.getLeft() <= reserved.getRight() && reserved.getLeft() <= a.getRight()) {
+                    HiveLog.log("CRITICAL re-partition assigned the MASTER'S rows " + reserved.getLeft()
+                        + "-" + reserved.getRight() + " to " + sortedSlaves.get(i) + " (" + a.getLeft() + "-" + a.getRight() + ")");
+                }
+            }
         }
         HiveLog.log(log.toString());
         printerModule.onIntervalsReassigned();
@@ -553,24 +604,49 @@ public final class SlaveSystem {
 
     /** Splits rows 0-127 into n contiguous sections with ~equal block counts. */
     private static ArrayList<Pair<Integer, Integer>> weightedIntervals(int[] rowBlocks, int n) {
+        ArrayList<Integer> rows = new ArrayList<>();
+        for (int r = 0; r < 128; r++) rows.add(r);
+        return splitRows(rows, rowBlocks, n);
+    }
+
+    /**
+     * Splits an ascending list of rows into n contiguous sections with ~equal
+     * (block-count weighted) totals. Used for full-range splits AND for
+     * re-partitions that must skip rows the master keeps for itself.
+     */
+    private static ArrayList<Pair<Integer, Integer>> splitRows(ArrayList<Integer> rows, int[] rowBlocks, int n) {
         long total = 0;
-        for (int b : rowBlocks) total += b;
+        for (int r : rows) total += rowBlocks != null ? rowBlocks[r] : 1;
         ArrayList<Pair<Integer, Integer>> out = new ArrayList<>();
-        int start = 0;
+        int startIdx = 0;
         int section = 0;
         long cum = 0;
-        for (int x = 0; x < 128; x++) {
-            cum += rowBlocks[x];
-            boolean last = x == 127;
+        for (int i = 0; i < rows.size(); i++) {
+            cum += rowBlocks != null ? rowBlocks[rows.get(i)] : 1;
+            boolean last = i == rows.size() - 1;
             long target = Math.round((double) total * (section + 1) / n);
             // Cut a section when we reach its cumulative block target, but always
             // leave at least one row for every remaining section.
-            if (!last && section < n - 1 && cum >= target && (127 - x) >= (n - 1 - section)) {
-                out.add(new Pair<>(start, x));
-                start = x + 1;
+            if (!last && section < n - 1 && cum >= target && (rows.size() - 1 - i) >= (n - 1 - section)) {
+                out.add(new Pair<>(rows.get(startIdx), rows.get(i)));
+                startIdx = i + 1;
                 section++;
             }
-            if (last) out.add(new Pair<>(start, x));
+            if (last) out.add(new Pair<>(rows.get(startIdx), rows.get(i)));
+        }
+        if (out.size() < n) {
+            // Degenerate distribution (e.g. long empty-row runs followed by a
+            // dense block): the weighted cut never fired for some sections.
+            // Under-assigning would silently leave bots on stale/absent rows -
+            // fall back to an equal-row split of the same rows instead.
+            HiveLog.log("SPLIT weighted split produced " + out.size() + "/" + n
+                + " sections - falling back to equal-row split");
+            out.clear();
+            int size = rows.size();
+            int per = (int) Math.ceil((double) size / n);
+            for (int start = 0; start < size; start += per) {
+                out.add(new Pair<>(rows.get(start), rows.get(Math.min(start + per, size) - 1)));
+            }
         }
         return out;
     }
@@ -932,8 +1008,8 @@ public final class SlaveSystem {
 
         // Register (received by a slave from the master; the socket connection
         // itself proves the master is reachable, so no render distance check)
-        if (cmd == HiveCommand.REGISTER && master == null && toBeConfirmedSlaves.isEmpty()
-            && slaves.isEmpty()) {
+        if (cmd == HiveCommand.REGISTER && (master == null || master.equals(sender))
+            && toBeConfirmedSlaves.isEmpty() && slaves.isEmpty()) {
             master = sender;
             queueMasterDM("accept");
             // Bootstrap confirmation back over the server DM channel
@@ -1221,6 +1297,17 @@ public final class SlaveSystem {
                 String hb = printerModule.getHeartbeatData();
                 if (hb != null) HiveLog.log("HEARTBEAT master: " + hb.substring(3));
                 long now = System.currentTimeMillis();
+                // Re-registration keepalive: a slave that left and rejoined the
+                // server (or raced a reconnect) can hold an OPEN socket without
+                // being registered - it never counts as a "new connection", so
+                // the auto-register handshake would never fire again and the
+                // slave would be locked out of the hive forever. Re-send the
+                // register handshake to every connected-but-unregistered peer;
+                // already-registered slaves answer via the idempotent duplicate
+                // path, so this is safe to repeat.
+                for (Map.Entry<WebSocket, String> entry : slaveConnections.entrySet()) {
+                    if (!slaves.contains(entry.getValue())) sendToSocket(entry.getKey(), "register");
+                }
                 for (String slave : slaves) {
                     long[] h = slaveHeartbeats.get(slave);
                     if (h != null && now - h[0] > 30000 && !hbStaleWarned.contains(slave)) {

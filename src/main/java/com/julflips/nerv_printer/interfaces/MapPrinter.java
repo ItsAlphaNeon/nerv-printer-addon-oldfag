@@ -89,6 +89,15 @@ public interface MapPrinter {
      */
     void onInviteAccepted();
 
+    /**
+     * Master-side: the row interval the master is currently keeping for itself
+     * (or null). Used by re-partitions so a non-anchor master's own rows are
+     * NEVER handed to slaves (double ownership = bots fighting over blocks).
+     */
+    default Pair<Integer, Integer> reservedMasterInterval() {
+        return null;
+    }
+
     void goToCorner(int cornerIndex);
 
     void onIntervalsReassigned();

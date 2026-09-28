@@ -535,6 +535,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         expectButtonPress = false;
         isWiping = false;
         pendingStart = false;
+        mapStale = false;
         pendingSetupBroadcast = false;
         finalizePhase = false;
         cornerCounter = 0;
@@ -592,6 +593,13 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 }
             } else if (SlaveSystem.isSlave()) {
                 SlaveSystem.queueMasterDM("leaving");
+                // Also forget the master and close the socket: the LEAVING path
+                // on the master never replies (by design), so if we kept the
+                // connection open we would stay "registered" locally while the
+                // master has already re-split our rows - and a re-activation
+                // would reuse the open socket, never re-handshake and never be
+                // re-registered (slaves permanently locked out of the hive).
+                SlaveSystem.slaveLeftHive();
             }
         }
     }
@@ -910,6 +918,12 @@ public class CarpetPrinter extends Module implements MapPrinter {
                             new Pair<>(needsBreak ? "break" : "", needsBreak ? p : null)));
                     }
                     checkpoints.add(new Pair(issueBlocks.get(0).toCenterPos(), new Pair("lineEnd", null)));
+                    // End the repair round by RETURNING to the finished-map chest -
+                    // the gate re-scans there. A trailing "lineEnd" was a dead end:
+                    // its handler rebuilds the path from our own (finished) interval,
+                    // discarding the remaining repair checkpoints, and the flow
+                    // degenerated into a silent fallback-lineEnd loop (wipe never ran).
+                    checkpoints.add(new Pair(finishedMapChest.getRight(), new Pair("finishedMapChest", null)));
                     state = State.Walking;
                     break;
                 }
@@ -974,6 +988,21 @@ public class CarpetPrinter extends Module implements MapPrinter {
         // log a PROGRESS line every 30s, and either anchor the dupers or steal work.
         if (!SlaveSystem.isSlave() && !finalizePhase && map != null
             && (state == State.Walking || state == State.Dumping || state == State.AwaitMasterAllBuilt || state == State.Afk)) {
+            // PARKED ANCHOR WITH NO SLAVES: every slave left while the master was
+            // parked at the AFK spot - nobody will finish the map or load the next
+            // one, and the parked master owns no rows (they were handed off).
+            // Wake up, take ownership back and resume building.
+            if (state == State.Afk && SlaveSystem.slaves.isEmpty()) {
+                HiveLog.log("ANCHOR wake-up - all slaves gone; exiting Afk and resuming");
+                warning("All slaves left the hive - leaving the AFK spot and resuming building.");
+                rowsHandedOff = false;
+                SlaveSystem.masterRowsHandedOff = false;
+                finalizeDelegate = null;
+                setInterval(new Pair<>(0, 127));
+                ownUnfinished = -1;
+                startBuilding(); // restarts the SAME map (placed rows are skipped)
+                return;
+            }
             if (++progressSweepTicks >= 600) {
                 progressSweepTicks = 0;
                 ownUnfinished = countUnfinishedRowsInInterval(workingInterval);
@@ -1365,12 +1394,12 @@ public class CarpetPrinter extends Module implements MapPrinter {
         // Load next nbt file
         if (state == State.AwaitNBTFile) {
             if (!prepareNextMapFile()) return;
-            // Hivemind: transmit the map, re-split rows and start the slaves
+            // Hivemind: re-split rows and start the slaves. The map transfer
+            // happens inside startBuilding() - sending it here too made every
+            // slave receive and re-parse every map TWICE.
             if (!SlaveSystem.isSlave()) {
                 if (SlaveSystem.slaves.isEmpty()) {
                     info("No slaves connected - single-user fallback (building the full map alone).");
-                } else {
-                    for (String slave : SlaveSystem.slaves) sendMapTo(slave);
                 }
                 SlaveSystem.generateIntervals();
             }
@@ -2073,6 +2102,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
         else if (state == State.AwaitSlaveContinue) phase = "PAUSED";
         else if (verifyingForMaster) phase = "VERIFYING";
         else if (map == null) phase = "NOMAP";
+        // The master waiting for its verifier used to report BUILDING - it is
+        // building nothing while it waits. (Checked BEFORE finalizePhase, which
+        // endBuilding sets while the verify pass runs.)
+        else if (state == State.AwaitVerify) phase = "VERIFYING";
         else if (finalizePhase) phase = "FINALIZING";
         else if (!isActive()) phase = "IDLE";
         else phase = "BUILDING";
@@ -2990,15 +3023,19 @@ public class CarpetPrinter extends Module implements MapPrinter {
             // Never disturb an in-progress verify/finalize: a STALL re-partition
             // sends START to every slave, which used to wipe the checkpoint path.
             if (verifyingForMaster || finalizingForMaster) return;
-            // Resume after a pause
-            if (state.equals(State.AwaitSlaveContinue) && oldState != null && map != null
+            // Resume after a pause - but never resume building while the loaded map
+            // is stale (a replacement transfer is in flight or failed): fall through
+            // to the fresh-start branch, which waits for the new map instead.
+            if (!mapStale && state.equals(State.AwaitSlaveContinue) && oldState != null && map != null
                 && (oldState == State.Walking || oldState == State.Dumping)) {
                 state = oldState;
                 pendingStart = false;
                 return;
             }
-            // Fresh start from a parked/waiting state
-            if (map != null && hasFullSetup()) {
+            // Fresh start from a parked/waiting state. NEVER build with a map whose
+            // replacement transfer failed or is still in flight: `map` still holds
+            // the PREVIOUS map then, and building it would wreck the canvas.
+            if (map != null && !mapStale && hasFullSetup()) {
                 pendingStart = false;
                 startBuilding();
             } else {
@@ -3071,7 +3108,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
         return resetButton != null && cartographyTable != null && finishedMapChest != null
             && dumpStation != null && mapCorner != null && !materialDict.isEmpty()
             && !mapMaterialChests.isEmpty() && perimeterCorners.size() >= 4
-            && (!afkAnchor.get() || afkSpot != null);
+            // The AFK-anchor requirement is a MASTER duty - a slave whose local
+            // toggle happens to be ON (with no AFK spot of its own) must not be
+            // blocked from starting on the master's map.
+            && (SlaveSystem.isSlave() || !afkAnchor.get() || afkSpot != null);
     }
 
     @Override
@@ -3139,8 +3179,10 @@ public class CarpetPrinter extends Module implements MapPrinter {
             // Afk included: while the master anchors the dupers the build phase is
             // still running - a late joiner must receive the map or it idles in
             // AwaitMasterMap forever (and its assigned rows are never built).
+            // NO "start" here: connecting/registering must never make a slave
+            // build. Slaves only start when the master runs .startprinter,
+            // .resumeprint, or starts the next map.
             sendMapTo(slave);
-            SlaveSystem.queueDM(slave, "start");
         }
     }
 
@@ -3220,6 +3262,13 @@ public class CarpetPrinter extends Module implements MapPrinter {
     private long loadedMapCrc = -1;
     private int pendingMapStallTicks = 0;
     private int pendingMapRetries = 0;
+    /**
+     * Slave-side: true from the moment a NEW map transfer starts until the new
+     * map is fully received AND loaded. While true, the in-memory {@code map} is
+     * the PREVIOUS map - a start must never begin building with it (a failed
+     * transfer would otherwise make the slave rebuild the last loaded map).
+     */
+    private boolean mapStale = false;
 
     /**
      * Asks the master to re-send the map. Gives up after 5 attempts so a dead
@@ -3233,6 +3282,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
             pendingMapChunks.clear();
             pendingMapTotal = -1;
             pendingMapRetries = 0;
+            // The in-memory map is still the PREVIOUS one - it must never be built.
+            mapStale = true;
             // Tell the master - otherwise it waits for us forever: with no map
             // our rows can never be built and the whole hive stalls on this map.
             SlaveSystem.queueMasterDM("mapFailed:" + fileName);
@@ -3269,7 +3320,9 @@ public class CarpetPrinter extends Module implements MapPrinter {
             if (idx == 0 && mapFile != null && mapFile.getName().equals(fileName) && map != null
                 && crc == loadedMapCrc && (state == State.Walking || state == State.Dumping)) return;
 
-            // New transfer (different file/checksum) resets the assembly buffer
+            // New transfer (different file/checksum) resets the assembly buffer.
+            // From this moment the in-memory map is the PREVIOUS one - no start
+            // may build with it until the new map is fully received and loaded.
             if (pendingMapName == null || !pendingMapName.equals(fileName) || pendingMapCrc != crc) {
                 pendingMapName = fileName;
                 pendingMapCrc = crc;
@@ -3277,6 +3330,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
                 pendingMapChunks.clear();
                 pendingMapStallTicks = 0;
                 pendingMapRetries = 0;
+                mapStale = true;
             }
             if (pendingMapChunks.put(idx, b64) == null && pendingMapChunks.size() == 1) {
                 info("Receiving map §a" + fileName + "§7 from master (" + total + " chunk(s))...");
@@ -3319,11 +3373,14 @@ public class CarpetPrinter extends Module implements MapPrinter {
             mapFile = target;
             startedFiles.add(target);
             if (!loadNBTFile()) {
+                // loadNBTFile() leaves the OLD map in memory - keep refusing starts
+                mapStale = true;
                 requestRemap(fileName, "NBT parse failed");
                 return;
             }
             loadedMapCrc = crc;
             pendingMapRetries = 0;
+            mapStale = false; // the new map is fully received and loaded
             HiveLog.log("MAP RECEIVE " + fileName + " OK (" + bytes.length + " bytes)");
             if (pendingStart && hasFullSetup()) {
                 pendingStart = false;
@@ -3379,6 +3436,17 @@ public class CarpetPrinter extends Module implements MapPrinter {
             }
         }
         if (reactivated > 0) HiveLog.log("REACTIVATED " + reactivated + " parked slave(s) after interval reassignment");
+    }
+
+    /**
+     * Master-side: the row interval the master is currently keeping for itself.
+     * Re-partitions among slaves must NEVER assign these rows to a slave -
+     * double ownership makes bots repair (and break) each other's work.
+     */
+    @Override
+    public Pair<Integer, Integer> reservedMasterInterval() {
+        if (SlaveSystem.isSlave() || finalizePhase || rowsHandedOff) return null;
+        return workingInterval;
     }
 
     @Override
