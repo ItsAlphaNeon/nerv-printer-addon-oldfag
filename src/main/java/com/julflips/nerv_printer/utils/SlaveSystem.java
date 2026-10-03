@@ -17,6 +17,7 @@ import org.jetbrains.annotations.Nullable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
@@ -52,6 +53,8 @@ public final class SlaveSystem {
     // One-shot invite DM queue (spaced out to survive anti-spam plugins)
     private static final ArrayList<String> toBeSentInvites = new ArrayList<>();
     private static int inviteTimer = 0;
+    // Players invited this session (still joining - not strangers)
+    private static final HashSet<String> invitedPlayers = new HashSet<>();
 
     public static void setupSlaveSystem(MapPrinter module, int port, String address) {
         setupSlaveSystem(module, port, address, "w", "", " whispers: ");
@@ -70,6 +73,7 @@ public final class SlaveSystem {
             hbStaleWarned.clear();
             pendingAcks.clear();
             master = null;
+            StrangerDanger.setEnabled(false);
         }
         printerModule = module;
         boolean portChanged = masterPort != port;
@@ -293,6 +297,7 @@ public final class SlaveSystem {
     /** Called from the WebSocket client thread when the master connection drops. */
     public static void onClientDisconnected() {
         mc.execute(() -> {
+            StrangerDanger.onMasterLost();
             if (master != null) {
                 master = null;
                 ChatUtils.warning("Lost connection to master - reconnecting in 5s.");
@@ -792,6 +797,7 @@ public final class SlaveSystem {
         for (String player : foundPlayers) {
             if (slaves.contains(player)) continue;
             toBeSentInvites.add(directMessageCommand + " " + player + " hivemind:" + ip + ":" + masterPort);
+            invitedPlayers.add(player);
             invited++;
         }
         if (invited > 0) {
@@ -802,6 +808,12 @@ public final class SlaveSystem {
                 + "). Slaves cannot connect? Set §2advertised-ip§7 to this PC's real LAN IP.");
             HiveLog.log("INVITE advertised " + ip + " (interface: " + advertised.nicName + ")");
         }
+    }
+
+    /** True if the player is this bot, a registered/connected slave or was invited to the hive. */
+    public static boolean isHiveMember(String name) {
+        return name.equals(mc.player.getName().getString()) || name.equals(master) || slaves.contains(name)
+            || toBeConfirmedSlaves.contains(name) || slaveConnections.containsValue(name) || invitedPlayers.contains(name);
     }
 
     /** True if a player with this name is currently visible in render distance. */
@@ -964,6 +976,14 @@ public final class SlaveSystem {
                 printerModule.applyMapData(content.substring("map:".length()));
                 return;
             }
+            if (content.startsWith("stare:")) {
+                StrangerDanger.onMasterCommand(content);
+                return;
+            }
+        }
+        if (content.startsWith("seen:") && slaves.contains(sender)) {
+            StrangerDanger.onSightingReport(content.substring("seen:".length()));
+            return;
         }
 
         String[] t = content.replace(" ", "").split(":");
@@ -1053,6 +1073,7 @@ public final class SlaveSystem {
                 break;
             case REMOVE:
                 master = null;
+                StrangerDanger.onMasterLost();
                 printerModule.toggle();
                 break;
             case SKIP:
@@ -1107,6 +1128,7 @@ public final class SlaveSystem {
                 HiveLog.log("REGISTER " + sender + " (total slaves: " + slaves.size() + ")");
                 generateIntervals();
                 printerModule.slaveRegistered(sender);
+                StrangerDanger.onSlaveRegistered(sender);
                 if (tableController != null) tableController.rebuild();
                 break;
             case FINISHED:
@@ -1251,6 +1273,8 @@ public final class SlaveSystem {
                 inviteTimer = 40;
             }
         }
+
+        StrangerDanger.tick();
 
         // Slave side: reconnect to the master when the connection drops
         if (!isMasterMode()) {

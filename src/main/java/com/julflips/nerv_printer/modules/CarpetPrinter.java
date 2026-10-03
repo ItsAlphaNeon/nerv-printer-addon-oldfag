@@ -341,6 +341,15 @@ public class CarpetPrinter extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<Boolean> strangerDanger = sgMultiUser.add(new BoolSetting.Builder()
+        .name("stranger-danger")
+        .description("Joke: when a player outside the hive is spotted, all bots stare at them, then sneak up to 5 blocks away. Back to work after 3 minutes (master only).")
+        .defaultValue(false)
+        .onChanged(StrangerDanger::setEnabled)
+        .visible(() -> masterAddress.get().trim().isEmpty())
+        .build()
+    );
+
     // Chat transport used ONLY for the bootstrap invite (hivemind:<ip>:<port>)
 
     private final Setting<String> directMessageCommand = sgMultiUser.add(new StringSetting.Builder()
@@ -547,6 +556,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         SlaveSystem.advertisedIpOverride = advertisedIp.get();
         SlaveSystem.setupSlaveSystem(this, masterPort.get(), masterAddress.get(),
             directMessageCommand.get(), senderPrefix.get(), senderSuffix.get());
+        StrangerDanger.setEnabled(strangerDanger.get());
 
         if (!customFolderPath.get()) {
             mapFolder = new File(Utils.getMinecraftDirectory(), "nerv-printer");
@@ -581,6 +591,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
     @Override
     public void onDeactivate() {
+        StrangerDanger.resetBot();
         Utils.setForwardPressed(false);
         // Notify the hive so nobody waits for a bot that silently vanished:
         // a deactivated slave is unregistered + re-split; a deactivated master
@@ -986,7 +997,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
         // Work-balance sweep (master, while building): refresh own progress,
         // log a PROGRESS line every 30s, and either anchor the dupers or steal work.
-        if (!SlaveSystem.isSlave() && !finalizePhase && map != null
+        // Paused while the hive is frozen by stranger danger (bots stand still on purpose).
+        if (!SlaveSystem.isSlave() && !finalizePhase && map != null && !StrangerDanger.isHiveFrozen()
             && (state == State.Walking || state == State.Dumping || state == State.AwaitMasterAllBuilt || state == State.Afk)) {
             // PARKED ANCHOR WITH NO SLAVES: every slave left while the master was
             // parked at the AFK spot - nobody will finish the map or load the next
@@ -1103,7 +1115,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         // VERIFY watchdog: the assigned verifier must report verifyDone. A
         // wedged/disconnected verifier gets replaced (capped); after the cap
         // the flow continues without verification (the wipe gate remains).
-        if (awaitingVerify && ++verifyWatchdogTicks >= VERIFY_WATCHDOG_TICKS) {
+        if (awaitingVerify && !StrangerDanger.isHiveFrozen() && ++verifyWatchdogTicks >= VERIFY_WATCHDOG_TICKS) {
             verifyWatchdogTicks = 0;
             if (verifyAttempts < MAX_VERIFY_ATTEMPTS && !SlaveSystem.slaves.isEmpty()) {
                 String failed = verifySlave;
@@ -1131,6 +1143,12 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (pendingSetupBroadcast && state.equals(State.SelectingChests) && hasFullSetup()) {
             pendingSetupBroadcast = false;
             broadcastSetup();
+        }
+
+        // Stranger danger joke: freeze the printer while the hive stares at a foreign player
+        if (StrangerDanger.tickBot(isSafeToFreeze())) {
+            lastTickTime = System.currentTimeMillis(); // No placement burst after resuming
+            return;
         }
 
         if (state.equals(State.AwaitMasterAllBuilt)) {
@@ -3452,6 +3470,16 @@ public class CarpetPrinter extends Module implements MapPrinter {
     @Override
     public boolean isFinalizePhase() {
         return finalizePhase;
+    }
+
+    /** True if the printer can be frozen for minutes without breaking an interaction in progress. */
+    private boolean isSafeToFreeze() {
+        final List<State> safeStates = List.of(State.Walking, State.Dumping, State.AwaitAreaClear,
+            State.AwaitSetup, State.AwaitMasterMap, State.AwaitMasterAllBuilt, State.AwaitVerify,
+            State.AwaitSlaveContinue, State.AwaitSlaveNextMap, State.Afk);
+        return safeStates.contains(state) && !isWiping && timeoutTicks == 0 && toBeSwappedSlot == -1
+            && restockBacklogSlots.isEmpty() && toBeHandledInvPacket == null
+            && mc.player.currentScreenHandler == mc.player.playerScreenHandler;
     }
 
     private boolean hasUnfinishedRowsInInterval() {
